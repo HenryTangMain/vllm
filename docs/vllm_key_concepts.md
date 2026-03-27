@@ -401,6 +401,7 @@ Req B skips computing KV for the entire 1000-token system prompt. Only the new q
 
 ### The Problem
 
+<<<<<<< HEAD
 When a new request arrives with a long prompt (say 10,000 tokens), the **prefill** step must compute KV for all those tokens in one forward pass. This is a big, expensive operation that **blocks** all ongoing decode requests.
 
 ```
@@ -561,11 +562,196 @@ vllm serve meta-llama/Llama-3-70B \
 **vLLM code**: Configuration in `vllm/config/speculative.py`, implementation in `vllm/v1/spec_decode/`.
 
 ---
+=======
+Without chunked prefill, a long prompt (e.g. 10,000 tokens) is processed all at once in a single step. This causes two problems:
+
+**1. Latency spike for decode requests**
+```
+Step 1: [Req A prefill — 10,000 tokens]   ← takes a long time
+Step 2: [Req B decode] [Req C decode]     ← B and C had to wait the entire step
+```
+Req B and C are stalled while the GPU chews through Req A's prefill. Their time-to-next-token spikes.
+
+**2. GPU underutilization**
+A huge prefill batch is compute-bound and memory-inefficient when mixed with decode tokens.
+
+### The Solution
+
+Split the long prefill across **multiple steps**, each processing a token budget (e.g. 512 tokens). Interleave those chunks with decode steps so decode requests are never starved.
+
+```
+Without chunked prefill:
+  Step 1: [Req A: 10,000 tokens prefill]              ← decode requests blocked
+  Step 2: [Req B decode] [Req C decode]
+
+With chunked prefill (budget=512):
+  Step 1: [Req A: 512 tokens] [Req B decode] [Req C decode]
+  Step 2: [Req A: 512 tokens] [Req B decode] [Req C decode]
+  ...
+  Step 20: [Req A: last 416 tokens] [Req B decode] [Req C decode]
+```
+
+Decode requests keep getting tokens every step. Req A takes longer to finish prefill, but no one is blocked.
+
+### How It Works in the Scheduler
+
+Every scheduling step has a **token budget** (`max_num_batched_tokens`, e.g. 2048). The scheduler fills it with running requests first (ongoing decodes + in-progress prefill chunks), then waiting requests (new arrivals).
+
+For a prefill request, the scheduler caps how many tokens it gets per step:
+
+```python
+num_new_tokens = min(remaining_prompt_tokens, long_prefill_token_threshold, token_budget)
+```
+
+Progress is tracked on the request:
+```python
+request.num_computed_tokens += num_scheduled_tokens
+request.is_prefill_chunk = (num_computed_tokens < total_tokens)  # still chunking?
+```
+
+The request stays in the running queue across steps until `num_computed_tokens == total_prompt_tokens`, then it enters decode.
+
+### Mixed Batch: Prefill + Decode Together
+
+A single forward pass can contain both prefill chunks and decode tokens simultaneously:
+
+```
+Batch in one step:
+  Req A: 512 prefill tokens   (query_len=512, is_prefilling=True)
+  Req B: 1 decode token       (query_len=1,   is_prefilling=False)
+  Req C: 1 decode token       (query_len=1,   is_prefilling=False)
+  Req D: 256 prefill tokens   (query_len=256, is_prefilling=True)
+```
+
+The attention kernel handles this via `is_prefilling` in `CommonAttentionMetadata` — prefill requests use full causal attention over their chunk, decode requests use cached KV blocks.
+
+### The Tradeoff
+
+| | Chunked Prefill ON | Chunked Prefill OFF |
+|---|---|---|
+| Decode latency (TTFT) | Smooth, no stalls | Spikes on long prompts |
+| Time to first token for new request | Slightly longer (prompt spread across steps) | Faster if no contention |
+| GPU utilization | More consistent | Bursty |
+
+### Configuration
+
+```python
+SchedulerConfig(
+    enable_chunked_prefill=True,       # enabled by default
+    max_num_batched_tokens=2048,       # total token budget per step
+    long_prefill_token_threshold=512,  # max tokens given to one prefill per step
+    max_num_partial_prefills=1,        # max concurrent in-progress prefills
+)
+```
+
+**vLLM code**: `vllm/v1/core/sched/scheduler.py` (token budget + chunking logic), `vllm/config/scheduler.py` (config), `vllm/v1/request.py` (`num_computed_tokens`, `is_prefill_chunk`).
+
+## 6. Speculative Decoding
+
+### The Problem
+
+Decode is slow because the target model (e.g. Llama 70B) generates **one token per step**. Each forward pass is expensive and sequential — token N depends on token N-1, so you can't parallelize generation.
+
+### The Solution
+
+Use a **cheap draft model** to guess several tokens ahead, then let the **expensive target model verify all of them in a single forward pass**.
+
+```
+Without spec decode:
+  Step 1: target generates "The"
+  Step 2: target generates "cat"
+  Step 3: target generates "sat"   ← 3 forward passes
+
+With spec decode (k=3 draft tokens):
+  Draft:  "The", "cat", "sat"      ← 1 cheap pass
+  Target: verify all 3 at once     ← 1 expensive pass
+  Result: 3 tokens in 1 target pass (if all accepted)
+```
+
+The key guarantee: **output distribution is identical to running the target model alone** — quality is never sacrificed.
+
+### Draft Model Variants
+
+vLLM supports several ways to generate draft tokens:
+
+| Method | How it works | Cost |
+|--------|-------------|------|
+| `ngram` | Matches a suffix in the prompt, copies what followed | Near zero (CPU) |
+| `draft_model` | A smaller model (e.g. Llama 1B drafts for Llama 70B) | Small model forward pass |
+| `eagle` / `eagle3` | Trained head that uses target model's hidden states | Very cheap |
+| `medusa` | Multiple heads attached to the target model | Very cheap |
+| `mtp` | DeepSeek-style multi-token prediction built into the model | Built-in |
+
+### How Verification Works (Rejection Sampling)
+
+After the target model runs, it produces probabilities for each draft position. For each draft token:
+
+**Greedy mode (temperature=0):**
+```
+Accept if:  target_argmax == draft_token
+Reject if:  target_argmax != draft_token → stop, use target's token instead
+```
+
+**Sampling mode (temperature>0):**
+```
+Accept if:  random(0,1) < target_prob(draft_token) / draft_prob(draft_token)
+Reject:     sample from residual = max(target_prob - draft_prob, 0)
+```
+
+If **all** k draft tokens are accepted, you also get a **bonus token** — the target model's prediction for the next position comes for free. Best case: k+1 tokens from one target pass.
+
+```
+Draft proposed:  ["The", "cat", "sat"]
+Target verified: ✓ accept  ✓ accept  ✗ reject → use "slept" instead
+Result:          ["The", "cat", "slept"]   ← 3 tokens, 1 target pass
+```
+
+### How It Integrates with the Scheduler & Model Runner
+
+```
+1. After each step, drafter.propose() generates k draft tokens per request
+   → stored in SchedulerOutput.scheduled_spec_decode_tokens
+
+2. Scheduler allocates k extra KV cache slots (num_lookahead_tokens)
+   → so the target model can attend to draft positions
+
+3. Model runner builds SpecDecodeMetadata:
+   → target_logits_indices: logit positions for draft tokens
+   → bonus_logits_indices:  position right after each draft sequence
+
+4. Target model forward pass runs on [real tokens + draft tokens]
+   → produces logits for all positions in one pass
+
+5. RejectionSampler compares draft vs. target probabilities
+   → returns accepted tokens + bonus token per request
+```
+
+### When Does It Help?
+
+Spec decode only helps when the **draft acceptance rate is high**. If the draft is wrong most of the time, you pay draft cost + target cost with no benefit.
+
+- **N-gram**: works well for repetitive text (code, structured output, RAG with quoted passages)
+- **EAGLE/draft model**: works well when the draft model's distribution closely matches the target
+- **Poor fit**: highly creative generation (high temperature, diverse outputs)
+
+### Configuration
+
+```python
+SpeculativeConfig(
+    method="eagle",                          # which drafter to use
+    model="meta-llama/Llama-3.1-8B",        # draft model (if method="draft_model")
+    num_speculative_tokens=5,               # how many tokens to draft per step
+)
+```
+
+**vLLM code**: `vllm/v1/spec_decode/` (proposers), `vllm/v1/sample/rejection_sampler.py` (verification), `vllm/config/speculative.py` (config), `vllm/v1/worker/gpu_model_runner.py` (integration).
+>>>>>>> a787d038b (update docs)
 
 ## 7. Quantization
 
 ### The Problem
 
+<<<<<<< HEAD
 Large models use massive amounts of GPU memory. A 70B parameter model in fp16 (2 bytes per param) needs ~140GB just for weights — more than a single GPU can hold. Even if it fits, loading all those bytes from GPU memory is the bottleneck during decoding (memory-bandwidth bound).
 
 ### The Solution
@@ -772,11 +958,251 @@ Rule of thumb: TP within a node (needs fast interconnect), PP across nodes (tole
 **vLLM code**: `vllm/distributed/` (parallel state, communication ops), `vllm/config/parallel.py` (configuration).
 
 ---
+=======
+Large models don't fit on GPU. Llama 3 70B in FP16 needs ~140 GB of VRAM — that's 2× H100s just for weights. Quantization shrinks weights (and sometimes activations) to lower precision, trading a small accuracy loss for massive memory savings and faster computation.
+
+### When Does Quantization Happen?
+
+**Most quantization happens BEFORE vLLM** — applied once after training using external tools, saved to a checkpoint. vLLM just loads and runs the pre-quantized weights.
+
+| Method | When quantized | Tool used |
+|--------|---------------|-----------|
+| AWQ | After training | `autoawq` library |
+| GPTQ | After training | `auto-gptq` library |
+| FP8 (static) | After training | NVIDIA ModelOpt, `llm-compressor` |
+| GGUF | After training | `llama.cpp` tools |
+| BitsAndBytes | At load time (first load) | `bitsandbytes` library |
+
+For these, the quantized model is published on HuggingFace (e.g. `TheBloke/Llama-2-70B-GPTQ`). vLLM reads `quantization_config` from `config.json`, auto-detects the method, and loads the pre-quantized weights.
+
+**Some things are quantized at runtime inside vLLM:**
+
+| What | When | Why |
+|------|------|-----|
+| FP8 dynamic activation scaling | Every forward pass, per token | Activations change each step, can't pre-compute |
+| FP8 KV cache | Every attention write/read | KV entries are generated at runtime |
+| AWQ/GPTQ dequantization | Every forward pass | Weights stored INT4, unpacked to FP16 for matmul |
+
+Note: dequantization (INT4 → FP16) is not the same as quantization. Weights stay INT4 in memory; vLLM converts them to FP16 just before the matrix multiply, then discards the FP16 copy.
+
+```
+Training → [AWQ/GPTQ/FP8 tools] → quantized checkpoint on disk
+                                          ↓
+                                    vLLM loads it
+                                    (no re-quantization)
+                                          ↓
+                              Runtime: only activations + KV cache
+                              are quantized dynamically per token
+```
+
+### What Gets Quantized
+
+Two things can be quantized independently:
+
+**Weights** — model parameters stored in VRAM. Compressed once at load time, stay compressed.
+
+**Activations** — intermediate values computed during each forward pass. Must be quantized on-the-fly per token.
+
+| Type | Weights | Activations | Shorthand |
+|------|---------|-------------|-----------|
+| Weight-only | Quantized | Full precision | W4A16, W8A16 |
+| Full quantization | Quantized | Quantized | W8A8 |
+
+Weight-only is simpler and more common. Full quantization (W8A8) requires computing activation scales per token but enables faster integer matrix multiplies.
+
+### The Major Methods
+
+**AWQ (W4A16)**
+- Weights stored as 4-bit integers, packed 8-per-int32
+- Activations stay FP16
+- Per-group scales (one scale per 128 weights)
+- On forward pass: dequantize weights back to FP16, then matmul in FP16
+
+**GPTQ (W4A16 or W8A16)**
+- Same idea as AWQ but different calibration algorithm
+- Supports 2/3/4/8 bit widths
+- `desc_act=True` adds activation reordering for better accuracy at low bits
+
+**FP8 (W8A8)**
+- Weights stored as `float8_e4m3fn` (4 exponent bits, 3 mantissa bits)
+- Activations also quantized to FP8 using a scale factor
+- Uses `torch.scaled_mm` — hardware-accelerated on H100/H200
+- Two activation modes:
+  - `static`: scale loaded from checkpoint, fast
+  - `dynamic`: scale computed per-token at runtime, more accurate
+- Best throughput at high batch sizes
+
+**BitsAndBytes (INT8/INT4)**
+- Uses the `bitsandbytes` library, not custom vLLM kernels
+- Quantizes at load time, not pre-saved
+- INT4 supports double quantization (quantize the scales too)
+
+### How Scale Factors Work (FP8 Example)
+
+You can't just truncate floats to 8 bits — the range is too small. So values are scaled first:
+
+```
+fp8_weight = fp32_weight / weight_scale      ← quantize (done once at load)
+fp32_weight ≈ fp8_weight * weight_scale      ← dequantize (done at runtime)
+
+fp8_activation = fp32_activation / input_scale   ← per token at runtime
+output = scaled_mm(fp8_activation, fp8_weight, input_scale, weight_scale)
+```
+
+Per-tensor scale = one number for the whole matrix. Per-group scale = one number per 128 weights (more accurate, slightly more overhead).
+
+### How It Integrates with Linear Layers
+
+Every linear layer has a pluggable `quant_method` object:
+
+```
+LinearLayer
+  └── quant_method: LinearMethodBase
+        ├── create_weights()               — allocate quantized tensors + scales at init
+        ├── process_weights_after_loading() — post-process (transpose, convert format)
+        └── apply()                        — called every forward pass: dequant + matmul
+```
+
+vLLM auto-detects the quantization method from `config.json` and swaps in the right `quant_method`. No model code changes needed.
+
+### KV Cache Quantization
+
+The KV cache itself can also be stored in FP8, independent of weight quantization. Separate scale factors (`k_scale`, `v_scale`) are loaded per layer:
+
+```
+store:  fp8_k = fp32_k / k_scale   → written to KV cache block
+fetch:  fp32_k = fp8_k * k_scale   → read back for attention
+```
+
+You can use FP16 weights with FP8 KV cache — they are independent settings.
+
+### Memory Savings
+
+| Method | Weight bits | Memory vs FP16 |
+|--------|-------------|----------------|
+| FP16 (baseline) | 16 | 1× |
+| FP8 / INT8 | 8 | ~0.5× |
+| INT4 (AWQ/GPTQ) | 4 | ~0.25× |
+| INT4 + FP8 KV cache | 4 + 8 | ~0.2× |
+
+**vLLM code**: `vllm/model_executor/layers/quantization/` (all methods), `vllm/model_executor/layers/linear.py` (integration point), `vllm/model_executor/layers/quantization/kv_cache.py` (KV cache quantization).
+
+## 8. Tensor/Pipeline/Expert Parallelism
+
+### Why Parallelism?
+
+A single GPU can't hold or compute a 70B+ model fast enough. vLLM splits work across GPUs in three fundamentally different ways, which can be combined.
+
+### Tensor Parallelism (TP)
+
+**Idea**: Split individual weight matrices across GPUs. Every GPU processes the same tokens but handles a different slice of each layer.
+
+**Column-parallel linear** — split the output dimension:
+```
+Weight A (4096 × 8192) with TP=4:
+  GPU 0: A_0  (4096 × 2048)   → output chunk 0
+  GPU 1: A_1  (4096 × 2048)   → output chunk 1
+  GPU 2: A_2  (4096 × 2048)   → output chunk 2
+  GPU 3: A_3  (4096 × 2048)   → output chunk 3
+```
+
+**Row-parallel linear** — split the input dimension:
+```
+Weight B (8192 × 4096) with TP=4:
+  GPU 0: B_0  (2048 × 4096)   → partial sum 0  ┐
+  GPU 1: B_1  (2048 × 4096)   → partial sum 1  ├─ AllReduce → final output
+  GPU 2: B_2  (2048 × 4096)   → partial sum 2  │
+  GPU 3: B_3  (2048 × 4096)   → partial sum 3  ┘
+```
+
+Attention heads are also split: with 32 heads and TP=4, each GPU computes 8 heads. No communication needed within attention since heads are independent.
+
+**Communication cost**: One AllReduce per transformer layer (after the row-parallel projection). Happens every forward pass.
+
+### Pipeline Parallelism (PP)
+
+**Idea**: Split the model's layers across GPUs. GPU 0 runs layers 0–15, GPU 1 runs layers 16–31, etc.
+
+```
+Tokens → [GPU 0: layers 0–15]  → hidden states (4096-dim tensor)
+       → [GPU 1: layers 16–31] → hidden states
+       → [GPU 2: layers 32–47] → hidden states
+       → [GPU 3: layers 48–63] → logits → sample
+```
+
+**What's sent between stages**: `IntermediateTensors` — the hidden state tensor `(batch_size, hidden_dim)` passed via point-to-point send/recv. Only the last PP rank runs the sampler and produces output tokens.
+
+**Communication cost**: One P2P transfer between each adjacent stage pair, per forward pass.
+
+### Expert Parallelism (EP) — MoE Models Only
+
+**Idea**: In Mixture-of-Experts models, each layer has N experts (e.g. 64) but activates only K per token (e.g. 2). Distribute those experts across GPUs so each GPU only stores and runs its share.
+
+```
+64 experts, EP=8:
+  GPU 0: experts 0–7
+  GPU 1: experts 8–15   ...   GPU 7: experts 56–63
+```
+
+The routing problem: Token X might be routed to expert 37 (on GPU 4) but currently lives on GPU 0. This requires **AllToAll** communication:
+
+```
+Step 1 — AllToAll: send tokens to the GPU that owns their assigned expert
+Step 2 — Each GPU runs its local experts on received tokens
+Step 3 — AllToAll: send results back to each token's original GPU
+Step 4 — Combine expert outputs (weighted sum)
+```
+
+**Communication cost**: Two AllToAll collectives per MoE layer.
+
+### Data Parallelism (DP)
+
+**Idea**: Run N complete copies of the model, each handling different requests. Full replication — no model splitting.
+
+```
+Request batch → Load balancer → [Model copy 0] → outputs
+                             → [Model copy 1] → outputs
+                             → [Model copy 2] → outputs
+```
+
+Best for maximizing throughput when you have more GPUs than needed for a single model instance. Each DP rank runs independently with its own scheduler.
+
+### How They Combine
+
+All four can be active simultaneously. vLLM assigns each GPU a rank in each dimension:
+
+```
+World size = TP × PP × DP
+
+Example: 16 GPUs, TP=4, PP=2, DP=2
+  GPU 0:  TP rank 0, PP rank 0, DP rank 0
+  GPU 1:  TP rank 1, PP rank 0, DP rank 0
+  GPU 2:  TP rank 2, PP rank 0, DP rank 0
+  GPU 3:  TP rank 3, PP rank 0, DP rank 0
+  GPU 4:  TP rank 0, PP rank 1, DP rank 0
+  ...
+  GPU 8:  TP rank 0, PP rank 0, DP rank 1   ← second DP copy starts here
+```
+
+`parallel_state.py` manages all process groups (`_TP`, `_PP`, `_EP`, `_DP`) and each layer queries its local rank to know which slice of work to do.
+
+### Quick Comparison
+
+| | TP | PP | EP | DP |
+|---|---|---|---|---|
+| What splits | Weight matrices | Layers | Experts | Batches |
+| Communication | AllReduce per layer | P2P between stages | AllToAll per MoE layer | None (inference) |
+| Memory saving per GPU | ÷ TP_size | ÷ PP_size | Experts ÷ EP_size | None (replicated) |
+| Best for | Single-node multi-GPU | Multi-node large models | MoE models | High throughput |
+
+**vLLM code**: `vllm/model_executor/layers/linear.py` (TP linear layers — `ColumnParallelLinear`, `RowParallelLinear`), `vllm/distributed/parallel_state.py` (process groups), `vllm/model_executor/layers/fused_moe/layer.py` (EP expert distribution), `vllm/distributed/communication_op.py` (collective ops).
+>>>>>>> a787d038b (update docs)
 
 ## 9. CUDA Graphs
 
 ### The Problem
 
+<<<<<<< HEAD
 During decode, each step generates just **one token per request**. The actual matrix math is tiny — but launching GPU kernels has overhead.
 
 ```
@@ -2089,3 +2515,586 @@ Send load, collect metrics
 ```
 
 **vLLM code**: `vllm/v1/metrics/loggers.py` (all metric definitions), `vllm/v1/metrics/stats.py` (TTFT/ITL tracking), `vllm/config/scheduler.py` (batching config), `vllm/config/cache.py` (KV cache config).
+=======
+Every time the CPU launches a GPU kernel, there is overhead: the CPU must package the kernel arguments, queue the launch, and the GPU driver validates it. A single transformer forward pass launches hundreds of kernels. At small batch sizes (decode phase with 1 token per request), this CPU-side overhead becomes the bottleneck — not the actual GPU computation.
+
+### The Solution
+
+**CUDA Graphs** let you record a sequence of GPU operations once, then replay the entire sequence with a single CPU call. The GPU executes identically to the recorded run, skipping all per-kernel launch overhead.
+
+```
+Without CUDA graph:
+  CPU: launch kernel 1 → launch kernel 2 → ... → launch kernel 300
+  (300 individual CPU→GPU roundtrips per step)
+
+With CUDA graph:
+  Capture: record kernels 1–300 once
+  Replay:  one CPU call → GPU runs all 300 kernels
+  (1 CPU→GPU roundtrip per step)
+```
+
+### Why Decode Can Use It But Prefill Can't
+
+CUDA graphs capture a **fixed computational pattern**. The graph structure must be identical on every replay — same kernels, same tensor shapes, same batch size.
+
+**Decode** is ideal for CUDA graphs:
+- Every request produces exactly 1 new token per step
+- Batch shape is predictable: `(num_requests, 1)`
+- Computational pattern is identical step after step
+
+**Prefill** cannot use full CUDA graphs:
+- Requests have different prompt lengths (variable sequence lengths)
+- Batch composition changes every step as requests arrive/finish
+- A 512-token prefill and a 128-token prefill require different kernel grid sizes
+
+**Solution for prefill — PIECEWISE mode**: Capture graphs *per layer* instead of for the whole model. Attention ops (which vary by sequence length) run eagerly outside the graph; everything else (linear layers, activations) runs in the captured graph.
+
+### Handling Variable Batch Sizes — Bucketing
+
+Since graphs require fixed sizes, vLLM pre-captures graphs at discrete batch sizes:
+
+```
+Default capture sizes: [1, 2, 4, 8, 16, 24, 32, ... 256, 272, 288, ...]
+```
+
+At runtime, the actual batch size is **padded up** to the nearest captured size:
+
+```
+Actual batch: 11 requests
+Nearest captured size: 16
+→ Pad with 5 dummy tokens (filled with -1)
+→ Replay the size-16 graph
+→ Ignore dummy outputs
+```
+
+The mapping from actual size → padded size is pre-computed at startup. The wasted computation on dummy tokens is small compared to the kernel launch savings.
+
+### Two Graph Modes
+
+**FULL mode** (decode batches):
+- Entire forward pass captured as one graph
+- Used when all requests are decoding (uniform 1 token per request)
+- Maximum performance benefit
+
+**PIECEWISE mode** (prefill / mixed batches):
+- Each layer's linear ops captured separately
+- Attention runs eagerly between graph segments
+- Less overhead reduction but still helps
+
+### Capture and Replay Flow
+
+**At model initialization** (`capture_model()`):
+```
+For each batch size in capture_sizes:
+  1. Run a warmup forward pass (populates caches, compiles kernels)
+  2. Record with torch.cuda.graph():
+       output = model.forward(padded_inputs)
+  3. Store graph + output tensors keyed by batch size
+```
+
+**At runtime** (each decode step):
+```
+1. Pad actual batch to nearest captured size
+2. Copy real inputs into the captured graph's input buffers
+3. graph.replay()  ← single CPU call
+4. Read outputs from the captured graph's output buffers
+```
+
+The input/output buffers are **pre-allocated and reused** — no new memory allocation per step.
+
+### Limitations
+
+- **Captures are fixed**: Any operation with runtime-dependent control flow (e.g. dynamic shapes, Python-level branching) cannot be inside a graph.
+- **Memory is pinned**: Graph buffers can't be resized after capture. vLLM allocates for the maximum captured batch size.
+- **Some attention backends**: Not all attention implementations support CUDA graph capture. vLLM automatically downgrades the graph mode if the backend doesn't support it.
+- **Graphs only help decode**: Prefill is already compute-bound (not kernel-launch-bound), so CUDA graphs provide minimal benefit there.
+
+**vLLM code**: `vllm/v1/cudagraph_dispatcher.py` (dispatch logic, bucketing), `vllm/compilation/cuda_graph.py` (`CUDAGraphWrapper` — capture and replay), `vllm/v1/worker/gpu/cudagraph_utils.py` (`CudaGraphManager`), `vllm/v1/worker/gpu_model_runner.py` (`capture_model()`).
+
+---
+
+## 10. Sampling
+
+### What Is Sampling?
+
+After the model produces logits (raw scores for each token in the vocabulary), the **sampler** converts those logits into an actual token. This involves several steps: applying penalties, temperature scaling, filtering, and finally selecting a token.
+
+### The Sampling Pipeline
+
+vLLM's sampler processes logits through these stages in order:
+
+```
+Raw Logits
+    ↓
+1. Compute logprobs (if requested)
+    ↓
+2. Convert to float32
+    ↓
+3. Apply allowed token ids whitelist
+    ↓
+4. Apply bad words exclusion
+    ↓
+5. Apply non-argmax-invariant processors:
+   - Min tokens (force generation until N tokens)
+   - Logit bias (boost/suppress specific tokens)
+    ↓
+6. Apply penalties:
+   - Repetition penalty
+   - Frequency penalty
+   - Presence penalty
+    ↓
+7. Sample the token:
+   - Greedy: argmax (if temperature=0)
+   - Random: temperature → min_p → top_k → top_p → sample
+    ↓
+8. Gather top-k logprobs (if requested)
+    ↓
+Output: token_id + optional logprobs
+```
+
+### Temperature
+
+Temperature controls the "sharpness" of the probability distribution:
+
+```
+probs = softmax(logits / temperature)
+```
+
+- **temperature = 0**: Greedy decoding — always pick the highest probability token
+- **temperature = 1**: Use raw probabilities as-is
+- **temperature > 1**: Flatter distribution — more randomness, more diverse outputs
+- **temperature < 1**: Sharper distribution — more deterministic, less diverse
+
+### Top-K and Top-P Filtering
+
+After temperature scaling, vLLM can filter the candidate tokens:
+
+**Top-K**: Keep only the K highest-probability tokens, redistribute probability mass
+
+```
+Vocabulary: [A=0.4, B=0.3, C=0.15, D=0.1, E=0.05]
+top_k=3:    [A=0.47, B=0.35, C=0.18]  ← only top 3 kept, renormalized
+```
+
+**Top-P (nucleus sampling)**: Keep the smallest set of tokens whose cumulative probability exceeds P
+
+```
+Sorted:     [A=0.4, B=0.3, C=0.15, D=0.1, E=0.05]
+top_p=0.8:  [A=0.53, B=0.4, C=0.07]  ← cumsum reaches 0.85 at C, renormalized
+```
+
+These filters reduce the chance of sampling low-probability "garbage" tokens while preserving diversity among likely candidates.
+
+### Repetition Penalties
+
+vLLM supports three types of penalties to reduce repetitive output:
+
+**Repetition penalty**: Multiplicative penalty on previously-seen tokens
+```
+if token in prompt_or_generated:
+    logit[token] /= repetition_penalty  (if logit > 0)
+    logit[token] *= repetition_penalty  (if logit < 0)
+```
+
+**Frequency penalty**: Linear penalty based on how many times a token appeared
+```
+logit[token] -= frequency_penalty * count[token]
+```
+
+**Presence penalty**: Fixed penalty if the token appeared at all
+```
+logit[token] -= presence_penalty * (1 if count[token] > 0 else 0)
+```
+
+### Batched Sampling
+
+vLLM samples all requests in a batch simultaneously using GPU-accelerated operations. Each request can have different sampling parameters (temperature, top_p, etc.), stored in `SamplingMetadata`:
+
+```python
+SamplingMetadata:
+    temperature: Tensor[num_requests]     # per-request temperature
+    top_p: Tensor[num_requests]           # per-request top_p
+    top_k: Tensor[num_requests]           # per-request top_k
+    ...
+```
+
+The sampler expands these per-request values to per-token during the forward pass.
+
+**vLLM code**: `vllm/v1/sample/sampler.py` (main sampler), `vllm/v1/sample/metadata.py` (sampling metadata), `vllm/v1/sample/ops/` (individual operations: penalties, top-k/top-p, etc.).
+
+---
+
+## 11. Structured Output
+
+### The Problem
+
+LLMs generate free-form text, but many applications need structured output — valid JSON, specific formats, or adherence to a schema. Without constraints, models can produce syntactically invalid output that breaks downstream parsers.
+
+### The Solution
+
+**Structured output** (also called "constrained decoding" or "grammar-guided generation") restricts the model's output to valid tokens at each step according to a grammar or schema.
+
+```
+Without structured output:
+  Model generates: {"name": "Alice", "age": 30,   ← incomplete, invalid JSON
+
+With structured output:
+  After {"name": "Alice", "age": 30, the valid next tokens are:
+    "}" (close object), '"' (start new key)
+  NOT valid: letters, digits, random punctuation
+```
+
+### How It Works
+
+vLLM uses grammar-based token masking:
+
+1. **Compile the grammar**: Convert JSON schema / regex / EBNF into a finite state automaton
+2. **Track state**: As tokens are generated, update the automaton's current state
+3. **Compute valid tokens**: At each step, query which tokens are valid transitions from the current state
+4. **Mask logits**: Set invalid tokens' logits to -infinity before sampling
+
+```
+JSON Schema: {"type": "object", "properties": {"name": {"type": "string"}}}
+
+Step 1: valid tokens = ["{"]              → mask everything else
+Step 2: valid tokens = ['"']              → must start a key
+Step 3: valid tokens = [a-z, A-Z, ...]    → string characters
+...
+```
+
+### Supported Formats
+
+| Format | Parameter | Description |
+|--------|-----------|-------------|
+| JSON Schema | `guided_json=schema` | Output must conform to a JSON schema |
+| JSON Object | `response_format={"type": "json_object"}` | Any valid JSON object |
+| Regex | `guided_regex=pattern` | Output must match a regular expression |
+| Grammar | `guided_grammar=ebnf` | Output must conform to an EBNF grammar |
+| Choice | `guided_choice=["a", "b", "c"]` | Output must be one of the listed strings |
+
+### Backend Implementations
+
+vLLM supports multiple backends for grammar compilation and mask computation:
+
+| Backend | Library | Strengths |
+|---------|---------|-----------|
+| **xgrammar** (default) | `xgrammar` | Fast, GPU-accelerated mask computation, caches compiled grammars |
+| **outlines** | `outlines` | Mature, supports complex grammars |
+| **lm-format-enforcer** | `lm-format-enforcer` | Lightweight, good regex support |
+| **guidance** | `guidance` | Integration with guidance library |
+
+### Performance Considerations
+
+- **Grammar compilation**: Done once per unique schema, then cached
+- **Mask computation**: Per-token overhead, but xgrammar does this on GPU
+- **Speculative decoding**: Works with structured output — masks applied during verification
+
+```python
+# Example usage
+from vllm import LLM, SamplingParams
+
+llm = LLM(model="meta-llama/Llama-3.1-8B-Instruct")
+
+params = SamplingParams(
+    guided_json={
+        "type": "object",
+        "properties": {
+            "name": {"type": "string"},
+            "age": {"type": "integer"}
+        },
+        "required": ["name", "age"]
+    }
+)
+output = llm.generate("Extract info: John is 25 years old", params)
+# Guaranteed valid JSON: {"name": "John", "age": 25}
+```
+
+**vLLM code**: `vllm/v1/structured_output/` (all backends), `vllm/v1/structured_output/backend_xgrammar.py` (default backend), `vllm/sampling_params.py` (guided decoding parameters).
+
+---
+
+## 12. LoRA (Low-Rank Adaptation)
+
+### The Problem
+
+Fine-tuning adapts a model to specific tasks, but full fine-tuning requires storing separate copies of the entire model for each variant — prohibitively expensive for serving multiple specialized versions.
+
+### The Solution
+
+**LoRA** (Low-Rank Adaptation) freezes the base model and trains small adapter matrices. At inference time, vLLM dynamically loads/unloads these adapters, serving many fine-tuned variants from a single base model.
+
+### How LoRA Works
+
+Instead of modifying weight matrix W directly, LoRA adds a low-rank decomposition:
+
+```
+Original:  output = input @ W                    (W is d×k)
+LoRA:      output = input @ W + input @ A @ B   (A is d×r, B is r×k)
+
+Where r << min(d, k), typically r = 8 to 64
+```
+
+The product `A @ B` has the same shape as W but uses far fewer parameters:
+- Full matrix: d × k parameters (e.g., 4096 × 4096 = 16M)
+- LoRA: d × r + r × k parameters (e.g., 4096 × 16 + 16 × 4096 = 131K)
+
+### vLLM's LoRA Serving Architecture
+
+```
+Base Model (frozen, shared)
+     ↓
+┌────────────────────────────────────┐
+│        Linear Layer                │
+│   W_base (shared across requests)  │
+│                                    │
+│   Request A → LoRA adapter 1       │
+│   Request B → LoRA adapter 2       │
+│   Request C → no adapter (base)    │
+└────────────────────────────────────┘
+```
+
+Key features:
+- **Base weights stay in GPU memory** — never copied
+- **LoRA weights are small** — loaded/unloaded per-request
+- **Batched execution** — requests with different adapters run together
+- **Fused kernels** — apply multiple LoRA adapters in a single kernel (Punica)
+
+### Multi-LoRA Batching
+
+vLLM can batch requests using different LoRA adapters:
+
+```
+Batch:
+  Request 1: base + LoRA_A   (customer support fine-tune)
+  Request 2: base + LoRA_B   (code generation fine-tune)
+  Request 3: base only       (general purpose)
+
+Forward pass:
+  1. Compute base model output for all requests
+  2. Apply LoRA_A to request 1's activations
+  3. Apply LoRA_B to request 2's activations
+  4. Request 3 uses base output directly
+```
+
+The **Punica** kernel fuses these adapter applications for efficiency.
+
+### Configuration
+
+```python
+from vllm import LLM
+from vllm.lora.request import LoRARequest
+
+# Enable LoRA support
+llm = LLM(
+    model="meta-llama/Llama-3.1-8B",
+    enable_lora=True,
+    max_loras=4,              # max adapters in GPU memory simultaneously
+    max_lora_rank=64,         # max rank supported
+)
+
+# Define LoRA adapters
+lora_customer = LoRARequest("customer_support", 1, "/path/to/customer_lora")
+lora_code = LoRARequest("code_gen", 2, "/path/to/code_lora")
+
+# Generate with specific adapter
+output = llm.generate("Hello", lora_request=lora_customer)
+```
+
+### Memory Management
+
+vLLM manages LoRA adapters with an LRU cache:
+
+```
+GPU LoRA Cache (max_loras=4):
+  [LoRA_A, LoRA_B, LoRA_C, LoRA_D]  ← full
+
+New request needs LoRA_E:
+  Evict LRU (LoRA_A) → Load LoRA_E
+  [LoRA_E, LoRA_B, LoRA_C, LoRA_D]
+```
+
+**vLLM code**: `vllm/lora/lora_model.py` (LoRA model class), `vllm/lora/layers/` (LoRA-enabled layers), `vllm/lora/punica_wrapper/` (fused kernels), `vllm/lora/model_manager.py` (adapter loading/caching).
+
+---
+
+## 13. Multimodal Support
+
+### What Are Multimodal Models?
+
+Multimodal (or vision-language) models process both text and other modalities — images, audio, video. Examples: LLaVA, Qwen-VL, Pixtral, Phi-3-Vision.
+
+### Architecture Overview
+
+Most vision-language models follow this pattern:
+
+```
+Image → [Vision Encoder] → image embeddings (e.g., 576 tokens)
+                              ↓
+Text  → [Tokenizer]      → text token ids
+                              ↓
+                    [Merge/Interleave]
+                              ↓
+                    [Language Model] → output tokens
+```
+
+The vision encoder (often a ViT) converts images into a sequence of embedding vectors that the language model treats like text tokens.
+
+### How vLLM Handles Multimodal Inputs
+
+**1. Input Processing**
+
+```python
+# User provides image with text
+prompt = "What's in this image? <image>"
+image = PIL.Image.open("cat.jpg")
+
+# vLLM processes through HuggingFace processors
+inputs = {
+    "prompt": prompt,
+    "multi_modal_data": {"image": image}
+}
+```
+
+**2. Placeholder Expansion**
+
+The `<image>` placeholder gets replaced with the actual number of image tokens:
+
+```
+Input:  "What's in this image? <image>"
+After:  "What's in this image? [IMG_0][IMG_1]...[IMG_575]"
+        (576 image tokens for a typical ViT output)
+```
+
+**3. Embedding Merge**
+
+```
+Position:     0    1    2    3    4      5     ...   580   581
+Token:       What  's   in  this image? [IMG_0] ... [IMG_575] [EOS]
+Embedding:   [text embeddings]  [image embeddings from encoder]
+```
+
+### Supported Modalities
+
+| Modality | Input Type | Example Models |
+|----------|-----------|----------------|
+| Image | PIL Image, numpy array, tensor | LLaVA, Qwen-VL, Pixtral |
+| Video | List of frames, tensor | Qwen2-VL, LLaVA-Video |
+| Audio | Waveform array, (audio, sample_rate) | Qwen2-Audio, Whisper |
+
+### Encoder Caching
+
+For efficiency, vLLM caches vision encoder outputs when the same image is used across requests (similar to prefix caching for text):
+
+```
+Request 1: "Describe this image" + cat.jpg  → encode cat.jpg, cache result
+Request 2: "Count objects in image" + cat.jpg → reuse cached encoding
+```
+
+### Multi-Image Support
+
+Models like Qwen-VL support multiple images per request:
+
+```python
+prompt = "Compare these images: <image> and <image>"
+images = [image1, image2]
+
+# Each <image> placeholder expands independently
+```
+
+### Configuration
+
+```python
+from vllm import LLM, SamplingParams
+
+llm = LLM(
+    model="llava-hf/llava-1.5-7b-hf",
+    # Multimodal models auto-detected from config
+)
+
+outputs = llm.generate({
+    "prompt": "USER: <image>\nDescribe this image.\nASSISTANT:",
+    "multi_modal_data": {"image": image},
+})
+```
+
+**vLLM code**: `vllm/multimodal/` (input processing, registry), `vllm/multimodal/processing/` (per-model processors), `vllm/model_executor/models/` (multimodal model implementations), `vllm/v1/core/encoder_cache_manager.py` (encoder output caching).
+
+---
+
+## 14. KV Cache Offloading
+
+### The Problem
+
+GPU memory is limited. With long contexts (128K+ tokens) and many concurrent requests, the KV cache alone can exhaust GPU memory. You either reject requests or reduce batch size — both hurt throughput.
+
+### The Solution
+
+**KV cache offloading** moves KV cache blocks between GPU and a secondary storage tier (CPU memory, NVMe, or remote storage) based on access patterns. Frequently-accessed blocks stay on GPU; cold blocks are offloaded.
+
+### How It Works
+
+```
+GPU KV Cache                     CPU Memory (or NVMe)
+┌─────────────────┐              ┌─────────────────┐
+│ Block 0: hot    │              │ Block 5: cold   │
+│ Block 1: hot    │   ←swap→     │ Block 6: cold   │
+│ Block 2: warm   │              │ Block 7: cold   │
+│ (limited slots) │              │ (large capacity)│
+└─────────────────┘              └─────────────────┘
+```
+
+**Offload (GPU → CPU)**: When GPU is full and a new block is needed, evict the least-recently-used block to CPU.
+
+**Load (CPU → GPU)**: When a request needs a block that's on CPU, load it back to GPU before the attention computation.
+
+### Integration with Prefix Caching
+
+Offloading works together with prefix caching. When a cached prefix is offloaded:
+
+1. New request arrives with matching prefix
+2. Scheduler looks up the prefix — finds it's offloaded
+3. Scheduler prepares a load operation
+4. KV blocks are loaded from CPU → GPU
+5. Request proceeds using the loaded cache (no recomputation)
+
+### Offloading Tiers
+
+vLLM supports multiple offloading destinations:
+
+| Tier | Latency | Capacity | Use Case |
+|------|---------|----------|----------|
+| GPU | ~μs | Limited (16-80GB) | Hot data |
+| CPU RAM | ~ms | Large (100GB-1TB) | Warm data |
+| NVMe | ~10ms | Very large (TB+) | Cold data |
+| Remote (Redis/Mooncake) | ~100ms | Unlimited | Distributed caching |
+
+### Scheduling Considerations
+
+The scheduler must account for load latency:
+
+```
+Step N: Request A needs block 7 (offloaded)
+        → prepare_load(block 7) → returns LoadSpec
+        → async load starts
+
+Step N+1: Block 7 still loading
+          → Request A waits (or scheduler delays it)
+
+Step N+2: Block 7 loaded
+          → Request A proceeds
+```
+
+vLLM can hide load latency by prefetching — predicting which blocks will be needed and loading them proactively.
+
+### Configuration
+
+```python
+# Enable CPU offloading
+vllm serve model --kv-cache-offload-target cpu
+
+# With Redis for distributed offloading
+vllm serve model --kv-cache-offload-target redis --redis-url redis://localhost:6379
+```
+
+**vLLM code**: `vllm/v1/kv_offload/` (offloading managers), `vllm/v1/kv_offload/abstract.py` (interface), `vllm/v1/kv_offload/cpu/` (CPU offloading), `vllm/v1/core/kv_cache_manager.py` (integration with scheduler).
+>>>>>>> a787d038b (update docs)
