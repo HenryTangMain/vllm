@@ -1908,3 +1908,184 @@ This matters for NIXL KV transfer — the connector must know which layout each 
 - **Quantization**: FP8 KV cache requires a backend that supports it (FlashInfer)
 
 **vLLM code**: `vllm/v1/attention/backends/` (implementations), `vllm/v1/attention/selector.py` (selection logic), `vllm/v1/attention/backend.py` (abstract interface).
+
+---
+
+## 22. Performance Metrics & B200 Tuning
+
+### Key Metrics
+
+vLLM exposes metrics via Prometheus at `/metrics`. The most important ones:
+
+#### Latency Metrics
+
+| Metric | What It Measures | Target |
+|--------|-----------------|--------|
+| `vllm:time_to_first_token_seconds` | TTFT — time from request arrival to first output token | p99 < SLA |
+| `vllm:inter_token_latency_seconds` | ITL — time between consecutive output tokens | p99 < SLA |
+| `vllm:request_time_per_output_token_seconds` | TPOT — aggregate ITL per request | p99 < SLA |
+| `vllm:e2e_request_latency_seconds` | Total time from arrival to completion | p99 < SLA |
+| `vllm:request_queue_time_seconds` | Time spent waiting to be scheduled | Should be low |
+| `vllm:request_prefill_time_seconds` | Time spent in prefill phase | Diagnose TTFT |
+| `vllm:request_decode_time_seconds` | Time spent in decode phase | Diagnose ITL |
+
+#### Throughput & Utilization Metrics
+
+| Metric | What It Measures |
+|--------|-----------------|
+| `vllm:num_requests_running` | Requests currently in a batch |
+| `vllm:num_requests_waiting` | Requests queued, waiting to be scheduled |
+| `vllm:kv_cache_usage_perc` | KV cache utilization (0–1, where 1 = 100% full) |
+| `vllm:generation_tokens` | Cumulative output tokens (rate = tokens/sec) |
+| `vllm:prompt_tokens` | Cumulative input tokens processed |
+| `vllm:num_preemptions` | Cumulative preemptions (recompute events) |
+
+#### Cache Efficiency Metrics
+
+| Metric | What It Measures |
+|--------|-----------------|
+| `vllm:prefix_cache_queries` | Total prefix cache lookups (in tokens) |
+| `vllm:prefix_cache_hits` | Cache hits (in tokens) — `hits/queries` = hit rate |
+| `vllm:prompt_tokens_by_source{source="local_cache_hit"}` | Tokens served from cache (no recompute) |
+| `vllm:prompt_tokens_by_source{source="local_compute"}` | Tokens that required computation |
+| `vllm:prompt_tokens_recomputed` | Cached tokens that had to be recomputed (preemption waste) |
+
+### Diagnosing Bottlenecks
+
+```
+Check request_queue_time vs request_inference_time:
+
+  queue_time >> inference_time  →  throughput-bound (not enough batch capacity)
+  inference_time high, TTFT high  →  prefill-bound
+  inference_time high, ITL high   →  decode-bound
+```
+
+**TTFT high?**
+- Is `request_queue_time_seconds` large? → requests queuing up, increase `--max-num-seqs`
+- Is `request_prefill_time_seconds` large? → prefill is slow, increase `--max-num-partial-prefills`
+- Is `prefix_cache_hits / prefix_cache_queries` low? → repeated prompts not being cached
+
+**ITL high?**
+- Is `kv_cache_usage_perc` near 1.0? → memory pressure, reduce `--max-num-seqs` or use FP8 KV cache
+- Is `num_preemptions` growing? → requests being kicked out and recomputed, fix memory pressure
+- Is batch size small? → add speculative decoding to generate more tokens per step
+
+**Throughput low?**
+- Is `num_requests_waiting` large? → increase `--max-num-seqs` and `--max-num-batched-tokens`
+- Is `kv_cache_usage_perc` low? → room to admit more requests
+- Is GPU underutilized? → enable `--enable-dbo` (dual batch overlap)
+
+### B200 Tuning Plan
+
+#### Step 1 — Always Do First (Free Wins on B200)
+
+B200 has native FP8 tensor cores and 192GB HBM3e. FP8 is lossless-fast on this hardware:
+
+```bash
+vllm serve <model> \
+  --dtype bfloat16 \
+  --kv-cache-dtype fp8 \          # halves KV cache size, native hardware support
+  --gpu-memory-utilization 0.95   # safe to go higher on 192GB
+```
+
+**Signal**: `kv_cache_usage_perc` drops, more concurrent requests fit.
+
+#### Step 2 — Diagnose with Metrics
+
+```bash
+curl http://<host>:<port>/metrics | grep -E \
+  "time_to_first_token|inter_token_latency|kv_cache_usage|num_requests|prefix_cache|num_preemptions|queue_time|prefill_time|decode_time"
+```
+
+Compute cache hit rate:
+```
+hit_rate = prefix_cache_hits / prefix_cache_queries
+```
+
+#### Step 3 — Apply Targeted Fix
+
+**If throughput-bound** (`num_requests_waiting` large):
+```bash
+--max-num-seqs 512 \
+--max-num-batched-tokens 16384 \
+--enable-dbo \                          # overlap prefill and decode
+--dbo-prefill-token-threshold 512 \
+--dbo-decode-token-threshold 32
+```
+
+**If TTFT-bound** (prefill slow):
+```bash
+--max-num-partial-prefills 4 \          # parallel chunked prefills
+--long-prefill-token-threshold 2048 \   # chunk prompts > 2048 tokens
+--enable-prefix-caching                 # default on, ensure it's active
+```
+
+**If ITL-bound** (decode slow):
+```bash
+# Option A: Speculative decoding (best for code, structured output)
+--speculative-model "[ngram]" \
+--num-speculative-tokens 5 \
+--ngram-prompt-lookup-max 4
+
+# Option B: Reduce batch size to lower memory pressure
+--max-num-seqs 256
+```
+
+**If preemptions > 0**:
+```bash
+--scheduler-reserve-full-isl \   # admit request only if full sequence fits
+--max-num-seqs 256               # reduce concurrent sequences
+```
+
+#### Step 4 — Multi-GPU B200 (NVLink 5)
+
+```bash
+--tensor-parallel-size <num_gpus>   # use minimum TP that fits the model
+```
+
+Rule: minimum TP that fits the model in memory. B200 NVLink 5 is fast — TP overhead is low.
+
+#### Recommended Starting Config
+
+```bash
+vllm serve <model> \
+  --dtype bfloat16 \
+  --kv-cache-dtype fp8 \
+  --gpu-memory-utilization 0.95 \
+  --max-num-seqs 512 \
+  --max-num-batched-tokens 16384 \
+  --enable-chunked-prefill \
+  --max-num-partial-prefills 2 \
+  --enable-prefix-caching \
+  --enable-dbo \
+  --scheduler-reserve-full-isl \
+  --tensor-parallel-size <num_gpus>
+```
+
+Then iterate: measure metrics → identify bottleneck → apply fix → measure again.
+
+### Decision Flowchart
+
+```
+Start
+  │
+  ▼
+Enable FP8 + set gpu-memory-utilization 0.95   ← always, free win on B200
+  │
+  ▼
+Send load, collect metrics
+  │
+  ├── num_preemptions > 0?
+  │     └── --scheduler-reserve-full-isl, reduce --max-num-seqs
+  │
+  ├── num_requests_waiting large?
+  │     └── increase --max-num-seqs, --max-num-batched-tokens, --enable-dbo
+  │
+  ├── TTFT high (prefill slow)?
+  │     └── increase --max-num-partial-prefills, check prefix cache hit rate
+  │
+  └── ITL high (decode slow)?
+        └── add speculative decoding, or reduce --max-num-seqs
+```
+
+**vLLM code**: `vllm/v1/metrics/loggers.py` (all metric definitions), `vllm/v1/metrics/stats.py` (TTFT/ITL tracking), `vllm/config/scheduler.py` (batching config), `vllm/config/cache.py` (KV cache config).
