@@ -1,0 +1,1070 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>NVIDIA Dynamo + vLLM Architecture</title>
+<style>
+  @import url('https://fonts.googleapis.com/css2?family=Share+Tech+Mono&family=Exo+2:wght@300;400;600;700&display=swap');
+
+  :root {
+    --bg:       #070b14;
+    --panel:    #0d1526;
+    --border:   #1a2d4a;
+    --cyan:     #00d4ff;
+    --green:    #00ff9d;
+    --amber:    #ffaa00;
+    --red:      #ff4d6d;
+    --purple:   #a78bfa;
+    --dim:      #4a6080;
+    --text:     #c8dff0;
+    --mono:     'Share Tech Mono', monospace;
+    --sans:     'Exo 2', sans-serif;
+  }
+
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+
+  body {
+    background: var(--bg);
+    color: var(--text);
+    font-family: var(--sans);
+    min-height: 100vh;
+    overflow-x: hidden;
+  }
+
+  /* grid background */
+  body::before {
+    content: '';
+    position: fixed; inset: 0;
+    background-image:
+      linear-gradient(rgba(0,212,255,0.03) 1px, transparent 1px),
+      linear-gradient(90deg, rgba(0,212,255,0.03) 1px, transparent 1px);
+    background-size: 40px 40px;
+    pointer-events: none;
+    z-index: 0;
+  }
+
+  .page {
+    position: relative; z-index: 1;
+    max-width: 1400px;
+    margin: 0 auto;
+    padding: 32px 24px 48px;
+  }
+
+  /* ── header ── */
+  header {
+    text-align: center;
+    margin-bottom: 40px;
+  }
+  header .eyebrow {
+    font-family: var(--mono);
+    font-size: 11px;
+    letter-spacing: 4px;
+    color: var(--cyan);
+    text-transform: uppercase;
+    margin-bottom: 8px;
+  }
+  header h1 {
+    font-family: var(--sans);
+    font-weight: 700;
+    font-size: 28px;
+    letter-spacing: 1px;
+    color: #fff;
+  }
+  header h1 span { color: var(--cyan); }
+  header .sub {
+    font-family: var(--mono);
+    font-size: 12px;
+    color: var(--dim);
+    margin-top: 6px;
+  }
+
+  /* ── legend ── */
+  .legend {
+    display: flex; flex-wrap: wrap; gap: 16px;
+    justify-content: center;
+    margin-bottom: 36px;
+  }
+  .legend-item {
+    display: flex; align-items: center; gap: 6px;
+    font-family: var(--mono); font-size: 11px;
+    color: var(--dim);
+  }
+  .legend-dot {
+    width: 10px; height: 10px; border-radius: 2px;
+  }
+  .legend-line {
+    width: 24px; height: 2px;
+  }
+
+  /* ── main grid ── */
+  .arch {
+    display: grid;
+    grid-template-columns: 1fr 280px;
+    grid-template-rows: auto;
+    gap: 16px;
+  }
+
+  .main-flow { grid-column: 1; display: flex; flex-direction: column; gap: 16px; }
+  .infra-col { grid-column: 2; display: flex; flex-direction: column; gap: 16px; }
+
+  /* ── box primitives ── */
+  .box {
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    background: var(--panel);
+    position: relative;
+    padding: 16px;
+    transition: box-shadow .3s;
+  }
+  .box:hover { box-shadow: 0 0 24px rgba(0,212,255,.08); }
+
+  .box-label {
+    font-family: var(--mono);
+    font-size: 10px;
+    letter-spacing: 3px;
+    text-transform: uppercase;
+    position: absolute;
+    top: -10px; left: 12px;
+    padding: 0 6px;
+    background: var(--panel);
+  }
+
+  .box.cyan  { border-color: rgba(0,212,255,.35); }
+  .box.cyan  .box-label { color: var(--cyan); }
+  .box.green { border-color: rgba(0,255,157,.35); }
+  .box.green .box-label { color: var(--green); }
+  .box.amber { border-color: rgba(255,170,0,.35); }
+  .box.amber .box-label { color: var(--amber); }
+  .box.red   { border-color: rgba(255,77,109,.35); }
+  .box.red   .box-label { color: var(--red); }
+  .box.purple{ border-color: rgba(167,139,250,.35); }
+  .box.purple .box-label { color: var(--purple); }
+
+  /* corner accent */
+  .box::after {
+    content: '';
+    position: absolute;
+    top: 0; right: 0;
+    width: 20px; height: 20px;
+    border-top: 2px solid;
+    border-right: 2px solid;
+    border-radius: 0 8px 0 0;
+    opacity: .4;
+  }
+  .box.cyan::after  { border-color: var(--cyan); }
+  .box.green::after { border-color: var(--green); }
+  .box.amber::after { border-color: var(--amber); }
+  .box.red::after   { border-color: var(--red); }
+  .box.purple::after{ border-color: var(--purple); }
+
+  /* ── component title ── */
+  .comp-title {
+    font-weight: 700;
+    font-size: 15px;
+    margin-bottom: 4px;
+    display: flex; align-items: center; gap: 8px;
+  }
+  .comp-icon {
+    width: 28px; height: 28px;
+    border-radius: 6px;
+    display: flex; align-items: center; justify-content: center;
+    font-size: 14px;
+    flex-shrink: 0;
+  }
+  .comp-subtitle {
+    font-family: var(--mono);
+    font-size: 10px;
+    color: var(--dim);
+    margin-bottom: 12px;
+    padding-left: 36px;
+  }
+
+  /* ── pills / tags ── */
+  .pills { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 10px; }
+  .pill {
+    font-family: var(--mono);
+    font-size: 10px;
+    padding: 3px 8px;
+    border-radius: 4px;
+    border: 1px solid;
+  }
+  .pill.c { color: var(--cyan);  border-color: rgba(0,212,255,.3);  background: rgba(0,212,255,.05); }
+  .pill.g { color: var(--green); border-color: rgba(0,255,157,.3);  background: rgba(0,255,157,.05); }
+  .pill.a { color: var(--amber); border-color: rgba(255,170,0,.3);  background: rgba(255,170,0,.05); }
+  .pill.r { color: var(--red);   border-color: rgba(255,77,109,.3); background: rgba(255,77,109,.05); }
+  .pill.p { color: var(--purple);border-color: rgba(167,139,250,.3);background: rgba(167,139,250,.05);}
+  .pill.d { color: var(--dim);   border-color: rgba(74,96,128,.3);  background: rgba(74,96,128,.05); }
+
+  /* ── arrow connectors ── */
+  .arrow {
+    display: flex; align-items: center; justify-content: center;
+    gap: 8px;
+    padding: 6px 0;
+  }
+  .arrow-line {
+    flex: 1;
+    height: 1px;
+    max-width: 120px;
+    position: relative;
+    overflow: visible;
+  }
+  .arrow-label {
+    font-family: var(--mono);
+    font-size: 10px;
+    padding: 2px 8px;
+    border-radius: 4px;
+    white-space: nowrap;
+  }
+
+  /* animated flow arrow */
+  .flow-arrow {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    margin: 4px 0;
+    gap: 2px;
+  }
+  .flow-arrow .protocol {
+    font-family: var(--mono);
+    font-size: 10px;
+    padding: 2px 10px;
+    border-radius: 10px;
+    border: 1px solid;
+  }
+  .flow-arrow .shaft {
+    width: 2px;
+    height: 24px;
+    position: relative;
+    overflow: hidden;
+  }
+  .flow-arrow .shaft::before {
+    content: '';
+    position: absolute;
+    top: -100%;
+    left: 0; right: 0;
+    height: 200%;
+    animation: flow 1.2s linear infinite;
+  }
+  .flow-arrow .shaft::after {
+    content: '▼';
+    position: absolute;
+    bottom: -8px;
+    left: 50%;
+    transform: translateX(-50%);
+    font-size: 10px;
+  }
+
+  @keyframes flow {
+    0%   { transform: translateY(0); }
+    100% { transform: translateY(100%); }
+  }
+
+  .fa-req .shaft { background: rgba(0,212,255,.2); }
+  .fa-req .shaft::before { background: linear-gradient(transparent,var(--cyan),transparent); }
+  .fa-req .shaft::after  { color: var(--cyan); }
+  .fa-req .protocol { color: var(--cyan); border-color: rgba(0,212,255,.4); background: rgba(0,212,255,.05); }
+
+  .fa-evt .shaft { background: rgba(255,170,0,.2); }
+  .fa-evt .shaft::before { background: linear-gradient(transparent,var(--amber),transparent); animation-direction: reverse; }
+  .fa-evt .shaft::after  { color: var(--amber); }
+  .fa-evt .protocol { color: var(--amber); border-color: rgba(255,170,0,.4); background: rgba(255,170,0,.05); }
+
+  .fa-stream .shaft { background: rgba(0,255,157,.2); }
+  .fa-stream .shaft::before { background: linear-gradient(transparent,var(--green),transparent); }
+  .fa-stream .shaft::after  { color: var(--green); }
+  .fa-stream .protocol { color: var(--green); border-color: rgba(0,255,157,.4); background: rgba(0,255,157,.05); }
+
+  /* ── worker grid ── */
+  .worker-row {
+    display: grid;
+    grid-template-columns: 1fr 16px 1fr;
+    gap: 0;
+    align-items: start;
+  }
+  .worker-divider {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    padding-top: 32px;
+    gap: 4px;
+  }
+  .worker-divider span {
+    font-family: var(--mono); font-size: 9px; color: var(--dim);
+    writing-mode: vertical-rl;
+    text-orientation: mixed;
+    letter-spacing: 2px;
+  }
+  .worker-divider .vline {
+    width: 1px;
+    height: 60px;
+    background: linear-gradient(transparent, var(--dim), transparent);
+  }
+
+  /* ── vllm engine inner ── */
+  .engine-inner {
+    margin-top: 10px;
+    border: 1px dashed rgba(74,96,128,.4);
+    border-radius: 6px;
+    padding: 10px;
+    background: rgba(0,0,0,.2);
+  }
+  .engine-title {
+    font-family: var(--mono);
+    font-size: 9px;
+    color: var(--dim);
+    letter-spacing: 2px;
+    text-transform: uppercase;
+    margin-bottom: 8px;
+    display: flex; align-items: center; gap: 6px;
+  }
+  .engine-title::before {
+    content: '';
+    display: inline-block;
+    width: 6px; height: 6px;
+    border-radius: 50%;
+    background: var(--green);
+    box-shadow: 0 0 6px var(--green);
+    animation: pulse 2s ease-in-out infinite;
+  }
+  @keyframes pulse {
+    0%,100% { opacity: 1; }
+    50%      { opacity: .3; }
+  }
+
+  /* ── event plane band ── */
+  .event-plane {
+    border: 1px solid rgba(255,170,0,.35);
+    border-radius: 8px;
+    background: linear-gradient(135deg, rgba(255,170,0,.04), rgba(255,170,0,.01));
+    padding: 14px 16px;
+    position: relative;
+  }
+  .event-plane .box-label { color: var(--amber); background: var(--panel); }
+  .event-plane-inner {
+    display: flex; gap: 12px; align-items: center; flex-wrap: wrap;
+  }
+  .ep-node {
+    background: rgba(255,170,0,.08);
+    border: 1px solid rgba(255,170,0,.25);
+    border-radius: 6px;
+    padding: 6px 12px;
+    font-family: var(--mono);
+    font-size: 11px;
+    color: var(--amber);
+    display: flex; align-items: center; gap: 6px;
+  }
+  .ep-arrow {
+    color: var(--amber);
+    font-size: 16px;
+    opacity: .6;
+    animation: nudge 1.5s ease-in-out infinite;
+  }
+  @keyframes nudge {
+    0%,100% { transform: translateX(0); }
+    50%      { transform: translateX(4px); }
+  }
+
+  /* ── request plane row ── */
+  .req-plane-band {
+    display: flex;
+    align-items: stretch;
+    gap: 0;
+    border: 1px solid rgba(0,212,255,.2);
+    border-radius: 8px;
+    background: rgba(0,212,255,.02);
+    padding: 10px 16px;
+    justify-content: space-between;
+  }
+  .rp-node {
+    background: rgba(0,212,255,.07);
+    border: 1px solid rgba(0,212,255,.2);
+    border-radius: 6px;
+    padding: 5px 12px;
+    font-family: var(--mono);
+    font-size: 11px;
+    color: var(--cyan);
+  }
+  .rp-arrow {
+    display: flex; align-items: center;
+    color: var(--cyan); opacity: .4;
+    font-size: 18px;
+    padding: 0 8px;
+    animation: nudge 1.8s ease-in-out infinite;
+  }
+
+  /* ── infra boxes ── */
+  .infra-small {
+    font-size: 12px;
+  }
+  .infra-item {
+    display: flex; align-items: flex-start; gap: 8px;
+    padding: 8px 0;
+    border-bottom: 1px solid var(--border);
+    font-size: 12px;
+  }
+  .infra-item:last-child { border-bottom: none; padding-bottom: 0; }
+  .infra-dot {
+    width: 6px; height: 6px; border-radius: 50%;
+    flex-shrink: 0; margin-top: 4px;
+  }
+  .infra-key {
+    font-family: var(--mono);
+    font-size: 11px;
+    color: var(--text);
+    margin-bottom: 2px;
+  }
+  .infra-val {
+    font-family: var(--mono);
+    font-size: 10px;
+    color: var(--dim);
+  }
+
+  /* ── routing algo box ── */
+  .algo-box {
+    margin-top: 10px;
+    background: rgba(0,0,0,.3);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 10px 12px;
+    font-family: var(--mono);
+    font-size: 11px;
+    line-height: 1.8;
+    color: var(--dim);
+  }
+  .algo-box .key   { color: var(--purple); }
+  .algo-box .val   { color: var(--cyan); }
+  .algo-box .op    { color: var(--amber); }
+  .algo-box .comment { color: #354a60; }
+
+  /* ── metrics row ── */
+  .metrics-row {
+    display: grid;
+    grid-template-columns: repeat(3, 1fr);
+    gap: 8px;
+    margin-top: 8px;
+  }
+  .metric-chip {
+    background: rgba(0,0,0,.3);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 8px;
+    text-align: center;
+  }
+  .metric-chip .m-name {
+    font-family: var(--mono); font-size: 9px; color: var(--dim);
+    text-transform: uppercase; letter-spacing: 1px;
+    margin-bottom: 4px;
+  }
+  .metric-chip .m-val {
+    font-family: var(--mono); font-size: 12px; font-weight: 600;
+  }
+
+  /* ── flow number steps ── */
+  .step-num {
+    display: inline-flex; align-items: center; justify-content: center;
+    width: 18px; height: 18px;
+    border-radius: 50%;
+    font-family: var(--mono);
+    font-size: 9px;
+    font-weight: 700;
+    flex-shrink: 0;
+  }
+
+  /* ── section label ── */
+  .section-header {
+    font-family: var(--mono);
+    font-size: 10px;
+    letter-spacing: 3px;
+    text-transform: uppercase;
+    color: var(--dim);
+    padding: 0 0 8px;
+    border-bottom: 1px solid var(--border);
+    margin-bottom: 12px;
+  }
+
+  /* ── tooltip ── */
+  [data-tip] {
+    position: relative; cursor: help;
+  }
+  [data-tip]:hover::after {
+    content: attr(data-tip);
+    position: absolute;
+    bottom: calc(100% + 8px);
+    left: 50%; transform: translateX(-50%);
+    background: #0a1428;
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 6px 10px;
+    font-family: var(--mono);
+    font-size: 10px;
+    color: var(--text);
+    white-space: nowrap;
+    z-index: 100;
+    pointer-events: none;
+  }
+
+  /* ── mode toggle ── */
+  .mode-bar {
+    display: flex; gap: 8px;
+    justify-content: center;
+    margin-bottom: 20px;
+  }
+  .mode-btn {
+    font-family: var(--mono);
+    font-size: 11px;
+    padding: 6px 16px;
+    border-radius: 6px;
+    border: 1px solid var(--border);
+    background: transparent;
+    color: var(--dim);
+    cursor: pointer;
+    transition: all .2s;
+    letter-spacing: 1px;
+  }
+  .mode-btn.active {
+    border-color: var(--cyan);
+    color: var(--cyan);
+    background: rgba(0,212,255,.08);
+  }
+  .mode-btn:hover:not(.active) {
+    border-color: rgba(0,212,255,.3);
+    color: var(--text);
+  }
+
+  .disagg-note {
+    display: none;
+    font-family: var(--mono);
+    font-size: 10px;
+    color: var(--amber);
+    background: rgba(255,170,0,.06);
+    border: 1px solid rgba(255,170,0,.2);
+    border-radius: 6px;
+    padding: 8px 12px;
+    text-align: center;
+  }
+  body.disagg .disagg-note { display: block; }
+  body.disagg .agg-only { opacity: .35; }
+
+  /* kv transfer arrow only in disagg mode */
+  .kv-xfer { display: none; }
+  body.disagg .kv-xfer { display: flex; }
+
+  /* ── footer ── */
+  footer {
+    text-align: center;
+    margin-top: 32px;
+    font-family: var(--mono);
+    font-size: 10px;
+    color: var(--dim);
+    letter-spacing: 2px;
+  }
+</style>
+</head>
+<body>
+<div class="page">
+
+  <!-- Header -->
+  <header>
+    <div class="eyebrow">System Architecture</div>
+    <h1>NVIDIA <span>Dynamo</span> + vLLM</h1>
+    <div class="sub">Distributed LLM Serving — Component Topology &amp; Data Flow</div>
+  </header>
+
+  <!-- Legend -->
+  <div class="legend">
+    <div class="legend-item">
+      <div class="legend-dot" style="background:var(--cyan)"></div>
+      Request Plane (TCP/NATS)
+    </div>
+    <div class="legend-item">
+      <div class="legend-dot" style="background:var(--amber)"></div>
+      Event Plane (ZMQ/NATS)
+    </div>
+    <div class="legend-item">
+      <div class="legend-dot" style="background:var(--green)"></div>
+      Token Stream (SSE)
+    </div>
+    <div class="legend-item">
+      <div class="legend-dot" style="background:var(--purple)"></div>
+      KV Block Transfer (NIXL/NCCL)
+    </div>
+    <div class="legend-item">
+      <div class="legend-dot" style="background:var(--dim)"></div>
+      Control / Discovery
+    </div>
+  </div>
+
+  <!-- Mode toggle -->
+  <div class="mode-bar">
+    <button class="mode-btn active" onclick="setMode('agg')">Aggregated (current)</button>
+    <button class="mode-btn" onclick="setMode('disagg')">Disaggregated P/D</button>
+  </div>
+
+  <div class="arch">
+
+    <!-- ===== MAIN FLOW ===== -->
+    <div class="main-flow">
+
+      <!-- 1. Client -->
+      <div class="box cyan">
+        <div class="box-label">STEP 1</div>
+        <div class="comp-title">
+          <div class="comp-icon" style="background:rgba(0,212,255,.12)">⬡</div>
+          Client
+        </div>
+        <div class="comp-subtitle">User / Application</div>
+        <div class="pills">
+          <span class="pill c">POST /v1/chat/completions</span>
+          <span class="pill c">OpenAI-compatible API</span>
+          <span class="pill d">Authorization Bearer token</span>
+        </div>
+      </div>
+
+      <!-- Arrow: HTTP -->
+      <div class="flow-arrow fa-req">
+        <div class="protocol">HTTP</div>
+        <div class="shaft"></div>
+      </div>
+
+      <!-- 2. Frontend -->
+      <div class="box cyan">
+        <div class="box-label">STEP 2 · FRONTEND</div>
+        <div class="comp-title">
+          <div class="comp-icon" style="background:rgba(0,212,255,.12)">◈</div>
+          Frontend Service
+        </div>
+        <div class="comp-subtitle">dynamo.frontend — Rust engine + Python preprocessing</div>
+
+        <div style="display:grid; grid-template-columns:1fr 1fr; gap:8px; margin-top:8px;">
+          <div>
+            <div class="section-header">Preprocessing</div>
+            <div class="infra-item">
+              <div class="infra-dot" style="background:var(--cyan)"></div>
+              <div><div class="infra-key">Tokenization</div><div class="infra-val">"Hello" → [128000, 9906]</div></div>
+            </div>
+            <div class="infra-item">
+              <div class="infra-dot" style="background:var(--cyan)"></div>
+              <div><div class="infra-key">Jinja Template</div><div class="infra-val">chat template → token ids</div></div>
+            </div>
+            <div class="infra-item">
+              <div class="infra-dot" style="background:var(--cyan)"></div>
+              <div><div class="infra-key">Sampling Params</div><div class="infra-val">temp, top_p, max_tokens</div></div>
+            </div>
+          </div>
+          <div>
+            <div class="section-header">Routing Decision</div>
+            <div class="infra-item">
+              <div class="infra-dot" style="background:var(--purple)"></div>
+              <div><div class="infra-key">Router Mode</div><div class="infra-val">kv / round-robin / least-loaded</div></div>
+            </div>
+            <div class="infra-item">
+              <div class="infra-dot" style="background:var(--purple)"></div>
+              <div><div class="infra-key">Queue Policy</div><div class="infra-val">fcfs / wspt / lcfs</div></div>
+            </div>
+            <div class="infra-item">
+              <div class="infra-dot" style="background:var(--purple)"></div>
+              <div><div class="infra-key">Queue Threshold</div><div class="infra-val">DYN_ROUTER_QUEUE_THRESHOLD</div></div>
+            </div>
+          </div>
+        </div>
+        <div class="pills" style="margin-top:12px;">
+          <span class="pill c">port 8000</span>
+          <span class="pill d">DYN_REQUEST_PLANE=tcp</span>
+          <span class="pill d">DYN_ROUTER_MODE=kv</span>
+        </div>
+      </div>
+
+      <!-- Arrow: request plane to router -->
+      <div class="flow-arrow fa-req">
+        <div class="protocol">Request Plane · TCP</div>
+        <div class="shaft"></div>
+      </div>
+
+      <!-- 3. KV Router -->
+      <div class="box purple">
+        <div class="box-label">STEP 3 · ROUTER</div>
+        <div class="comp-title">
+          <div class="comp-icon" style="background:rgba(167,139,250,.12)">⬡</div>
+          KV Smart Router
+        </div>
+        <div class="comp-subtitle">lib/llm/src/kv_router.rs — embedded in Frontend Rust engine</div>
+
+        <div style="display:grid; grid-template-columns:1fr 1fr; gap:8px; margin-top:8px;">
+          <div>
+            <div class="section-header">KV Indexer</div>
+            <div class="infra-item">
+              <div class="infra-dot" style="background:var(--purple)"></div>
+              <div><div class="infra-key">Radix Tree</div><div class="infra-val">hash → worker_id mapping</div></div>
+            </div>
+            <div class="infra-item">
+              <div class="infra-dot" style="background:var(--purple)"></div>
+              <div><div class="infra-key">Block Tracking</div><div class="infra-val">BlockStored / BlockRemoved</div></div>
+            </div>
+            <div class="infra-item">
+              <div class="infra-dot" style="background:var(--purple)"></div>
+              <div><div class="infra-key">TTL Pruning</div><div class="infra-val">default 120s</div></div>
+            </div>
+          </div>
+          <div>
+            <div class="section-header">Scoring (per worker)</div>
+            <div class="algo-box" data-tip="Lower cost = preferred worker">
+              <span class="key">cost</span> <span class="op">=</span><br>
+              &nbsp;&nbsp;<span class="key">overlap_w</span> <span class="op">×</span> <span class="val">prefill_blks</span><br>
+              &nbsp;&nbsp;<span class="op">+</span> <span class="val">decode_blks</span><br>
+              <span class="comment">// default overlap_w=1.0</span>
+            </div>
+          </div>
+        </div>
+        <div class="pills" style="margin-top:12px;">
+          <span class="pill p">overlap_score_weight=1.0</span>
+          <span class="pill p">temperature=0.0 (deterministic)</span>
+          <span class="pill d">event_threads=4</span>
+        </div>
+      </div>
+
+      <!-- Arrow: request plane to workers -->
+      <div class="flow-arrow fa-req">
+        <div class="protocol">Request Plane · TCP</div>
+        <div class="shaft"></div>
+      </div>
+
+      <!-- Disagg note -->
+      <div class="disagg-note">
+        In disaggregated mode: Frontend calls Prefill worker first → KV blocks transferred → then Decode worker
+      </div>
+
+      <!-- 4. Workers row -->
+      <div class="worker-row">
+
+        <!-- Prefill Worker -->
+        <div class="box green">
+          <div class="box-label">STEP 4a · PREFILL <span class="agg-only" style="font-size:9px;">(= DECODE in agg)</span></div>
+          <div class="comp-title">
+            <div class="comp-icon" style="background:rgba(0,255,157,.12)">⚙</div>
+            VllmDecodeWorker
+          </div>
+          <div class="comp-subtitle">python -m dynamo.vllm — wraps vLLM AsyncLLM engine</div>
+
+          <div class="engine-inner">
+            <div class="engine-title">vLLM Engine (v1)</div>
+            <div class="infra-item">
+              <div class="infra-dot" style="background:var(--green)"></div>
+              <div><div class="infra-key">Scheduler</div><div class="infra-val">chunked prefill / FCFS</div></div>
+            </div>
+            <div class="infra-item">
+              <div class="infra-dot" style="background:var(--green)"></div>
+              <div><div class="infra-key">KV Cache Manager</div><div class="infra-val">BlockPool LRU eviction</div></div>
+            </div>
+            <div class="infra-item">
+              <div class="infra-dot" style="background:var(--green)"></div>
+              <div><div class="infra-key">GPU Model Runner</div><div class="infra-val">CUDA Graphs, FP8, TP</div></div>
+            </div>
+            <div class="infra-item" style="border-bottom:none;">
+              <div class="infra-dot" style="background:var(--amber)"></div>
+              <div><div class="infra-key">ZMQ Publisher</div><div class="infra-val">BlockStored/Removed → tcp://*:20080</div></div>
+            </div>
+          </div>
+
+          <div class="pills" style="margin-top:10px;">
+            <span class="pill g">Qwen3-Coder-Next</span>
+            <span class="pill g">TP=1 · 1 GPU</span>
+            <span class="pill d">gpu-mem-util=0.95</span>
+            <span class="pill d">CUDA_VISIBLE_DEVICES=0</span>
+          </div>
+        </div>
+
+        <!-- Divider -->
+        <div class="worker-divider">
+          <div class="vline"></div>
+          <span class="kv-xfer" style="display:none">KV</span>
+          <div class="vline"></div>
+        </div>
+
+        <!-- Decode Worker (disagg only) -->
+        <div class="box green agg-only" style="opacity:.25;">
+          <div class="box-label">STEP 4b · DECODE</div>
+          <div class="comp-title">
+            <div class="comp-icon" style="background:rgba(0,255,157,.12)">⚙</div>
+            VllmDecodeWorker
+            <span style="font-size:10px; color:var(--amber); font-family:var(--mono);">(disagg only)</span>
+          </div>
+          <div class="comp-subtitle">Separate pool — receives KV blocks from Prefill</div>
+
+          <div class="engine-inner">
+            <div class="engine-title">vLLM Engine (v1)</div>
+            <div class="infra-item">
+              <div class="infra-dot" style="background:var(--green)"></div>
+              <div><div class="infra-key">KV Connector</div><div class="infra-val">NIXL/NCCL block receive</div></div>
+            </div>
+            <div class="infra-item">
+              <div class="infra-dot" style="background:var(--green)"></div>
+              <div><div class="infra-key">Decode Loop</div><div class="infra-val">token generation per step</div></div>
+            </div>
+            <div class="infra-item" style="border-bottom:none;">
+              <div class="infra-dot" style="background:var(--amber)"></div>
+              <div><div class="infra-key">ZMQ Publisher</div><div class="infra-val">BlockStored/Removed events</div></div>
+            </div>
+          </div>
+
+          <div class="pills" style="margin-top:10px;">
+            <span class="pill a">KV transfer via NIXL</span>
+            <span class="pill p" data-tip="TRANSFER_LOCAL=0 forces network path">TRANSFER_LOCAL=0</span>
+          </div>
+        </div>
+      </div>
+
+      <!-- KV transfer arrow (disagg only) -->
+      <div class="kv-xfer flow-arrow" style="display:none; flex-direction:row; justify-content:center; align-items:center; gap:8px;">
+        <div style="font-family:var(--mono);font-size:10px;color:var(--purple);border:1px solid rgba(167,139,250,.3);padding:2px 8px;border-radius:4px;">
+          KV Blocks — NIXL/NCCL/P2P →→→ Decode Worker
+        </div>
+      </div>
+
+      <!-- Arrow: token stream back -->
+      <div class="flow-arrow fa-stream">
+        <div class="protocol">Token Stream · SSE</div>
+        <div class="shaft"></div>
+      </div>
+
+      <!-- 5. Event Plane -->
+      <div class="event-plane box">
+        <div class="box-label" style="color:var(--amber)">STEP 5 · EVENT PLANE (async)</div>
+        <div class="comp-title" style="margin-bottom:8px;">
+          <div class="comp-icon" style="background:rgba(255,170,0,.12)">⬡</div>
+          KV Cache Event Bus
+        </div>
+        <div class="comp-subtitle" style="padding-left:36px; margin-bottom:10px;">ZMQ pub/sub → NATS topic "kv-events" — asynchronous, fire-and-forget</div>
+
+        <div class="event-plane-inner">
+          <div class="ep-node">Worker ZMQ<br><span style="font-size:9px;opacity:.7">tcp://*:20080</span></div>
+          <div class="ep-arrow">→</div>
+          <div class="ep-node">KvEventPublisher<br><span style="font-size:9px;opacity:.7">dynamo.vllm relay</span></div>
+          <div class="ep-arrow">→</div>
+          <div class="ep-node">NATS<br><span style="font-size:9px;opacity:.7">topic: kv-events</span></div>
+          <div class="ep-arrow">→</div>
+          <div class="ep-node">Router Indexer<br><span style="font-size:9px;opacity:.7">radix tree update</span></div>
+        </div>
+
+        <div style="display:grid;grid-template-columns:repeat(3,1fr);gap:8px;margin-top:12px;">
+          <div class="ep-node" style="flex-direction:column;align-items:flex-start;">
+            <div style="font-size:9px;opacity:.5;margin-bottom:4px;">BlockStored</div>
+            block_hashes, token_ids,<br>parent_hash, block_size
+          </div>
+          <div class="ep-node" style="flex-direction:column;align-items:flex-start;">
+            <div style="font-size:9px;opacity:.5;margin-bottom:4px;">BlockRemoved</div>
+            block_hashes, medium="GPU"<br>(LRU eviction)
+          </div>
+          <div class="ep-node" style="flex-direction:column;align-items:flex-start;">
+            <div style="font-size:9px;opacity:.5;margin-bottom:4px;">AllBlocksCleared</div>
+            worker restart /<br>cache reset
+          </div>
+        </div>
+      </div>
+
+      <!-- Request plane band -->
+      <div style="margin-top:4px;">
+        <div class="section-header" style="text-align:center;">── Request Plane Transport ──</div>
+        <div class="req-plane-band">
+          <div class="rp-node">Frontend</div>
+          <div class="rp-arrow">→</div>
+          <div class="rp-node">Router</div>
+          <div class="rp-arrow">→</div>
+          <div class="rp-node">Prefill Worker</div>
+          <div class="rp-arrow kv-xfer" style="display:none">→</div>
+          <div class="rp-node kv-xfer" style="display:none">Decode Worker</div>
+          <div class="rp-arrow">←</div>
+          <div class="rp-node">Token Stream</div>
+          <div class="rp-arrow">←</div>
+          <div class="rp-node">Client</div>
+        </div>
+        <div style="text-align:center; margin-top:6px;">
+          <span style="font-family:var(--mono);font-size:10px;color:var(--dim)">DYN_REQUEST_PLANE=tcp &nbsp;|&nbsp; DYN_EVENT_PLANE=nats</span>
+        </div>
+      </div>
+
+    </div>
+
+    <!-- ===== INFRA COLUMN ===== -->
+    <div class="infra-col">
+
+      <!-- Dynamo Platform -->
+      <div class="box amber">
+        <div class="box-label">DYNAMO PLATFORM</div>
+        <div class="comp-title" style="font-size:13px;">
+          <div class="comp-icon" style="background:rgba(255,170,0,.12);font-size:12px;">◉</div>
+          Infrastructure
+        </div>
+        <div class="comp-subtitle">Deployed once per cluster</div>
+
+        <div style="margin-top:10px;">
+          <div class="infra-item">
+            <div class="infra-dot" style="background:var(--amber)"></div>
+            <div><div class="infra-key">etcd</div><div class="infra-val">Service discovery, worker registry</div></div>
+          </div>
+          <div class="infra-item">
+            <div class="infra-dot" style="background:var(--amber)"></div>
+            <div><div class="infra-key">NATS + JetStream</div><div class="infra-val">Event plane, request plane (opt)</div></div>
+          </div>
+          <div class="infra-item">
+            <div class="infra-dot" style="background:var(--amber)"></div>
+            <div><div class="infra-key">Dynamo Operator</div><div class="infra-val">CRD → K8s resource reconciler</div></div>
+          </div>
+          <div class="infra-item">
+            <div class="infra-dot" style="background:var(--amber)"></div>
+            <div><div class="infra-key">Planner</div><div class="infra-val">SLA-driven autoscaler</div></div>
+          </div>
+          <div class="infra-item">
+            <div class="infra-dot" style="background:var(--amber)"></div>
+            <div><div class="infra-key">Grove</div><div class="infra-val">NVLink-aware gang scheduling</div></div>
+          </div>
+        </div>
+      </div>
+
+      <!-- Current Deployment -->
+      <div class="box red">
+        <div class="box-label">YOUR DEPLOYMENT</div>
+        <div class="comp-title" style="font-size:13px;">
+          <div class="comp-icon" style="background:rgba(255,77,109,.12);font-size:12px;">⬛</div>
+          exp_1_agg_b200
+        </div>
+        <div class="comp-subtitle">sc09super22-b200 node</div>
+
+        <div style="margin-top:10px;">
+          <div class="infra-item">
+            <div class="infra-dot" style="background:var(--green)"></div>
+            <div><div class="infra-key">4× VllmDecodeWorker</div><div class="infra-val">1 B200 GPU each · TP=1</div></div>
+          </div>
+          <div class="infra-item">
+            <div class="infra-dot" style="background:var(--cyan)"></div>
+            <div><div class="infra-key">1× Frontend</div><div class="infra-val">NodePort 30866 → pod:8000</div></div>
+          </div>
+          <div class="infra-item">
+            <div class="infra-dot" style="background:var(--red)"></div>
+            <div><div class="infra-key">Model</div><div class="infra-val">Qwen3-Coder-Next (BF16 149GB)</div></div>
+          </div>
+          <div class="infra-item">
+            <div class="infra-dot" style="background:var(--red)"></div>
+            <div><div class="infra-key">⚠ prefix-caching</div><div class="infra-val">DISABLED — fix needed</div></div>
+          </div>
+          <div class="infra-item">
+            <div class="infra-dot" style="background:var(--amber)"></div>
+            <div><div class="infra-key">KV events</div><div class="infra-val">ZMQ tcp://*:20080 ✓</div></div>
+          </div>
+          <div class="infra-item">
+            <div class="infra-dot" style="background:var(--dim)"></div>
+            <div><div class="infra-key">kv-cache-dtype</div><div class="infra-val">BF16 (→ upgrade to FP8)</div></div>
+          </div>
+        </div>
+
+        <div class="metrics-row" style="margin-top:12px;">
+          <div class="metric-chip">
+            <div class="m-name">KV per GPU</div>
+            <div class="m-val" style="color:var(--red)">~30 GB</div>
+          </div>
+          <div class="metric-chip">
+            <div class="m-name">Weights</div>
+            <div class="m-val" style="color:var(--amber)">149 GB</div>
+          </div>
+          <div class="metric-chip">
+            <div class="m-name">HBM</div>
+            <div class="m-val" style="color:var(--cyan)">192 GB</div>
+          </div>
+        </div>
+      </div>
+
+      <!-- Observability -->
+      <div class="box purple">
+        <div class="box-label">OBSERVABILITY</div>
+        <div class="comp-title" style="font-size:13px;">
+          <div class="comp-icon" style="background:rgba(167,139,250,.12);font-size:12px;">◎</div>
+          Metrics &amp; Traces
+        </div>
+
+        <div style="margin-top:10px;">
+          <div class="infra-item">
+            <div class="infra-dot" style="background:var(--purple)"></div>
+            <div><div class="infra-key">Prometheus</div><div class="infra-val">worker:8000/metrics</div></div>
+          </div>
+          <div class="infra-item">
+            <div class="infra-dot" style="background:var(--purple)"></div>
+            <div><div class="infra-key">OpenTelemetry</div><div class="infra-val">→ Tempo:4317 (traces)</div></div>
+          </div>
+          <div class="infra-item">
+            <div class="infra-dot" style="background:var(--purple)"></div>
+            <div><div class="infra-key">KV Cache Metrics</div><div class="infra-val">--kv-cache-metrics flag</div></div>
+          </div>
+        </div>
+
+        <div style="margin-top:10px;">
+          <div class="section-header">Key KV Routing Signals</div>
+          <div class="pills">
+            <span class="pill p">prefix_cache_hits</span>
+            <span class="pill p">prefix_cache_queries</span>
+            <span class="pill p">kv_cache_usage_perc</span>
+            <span class="pill p">num_preemptions</span>
+            <span class="pill p">kv_block_lifetime_s</span>
+          </div>
+        </div>
+      </div>
+
+      <!-- Optimization path -->
+      <div class="box cyan infra-small">
+        <div class="box-label">OPTIMIZATION STEPS</div>
+        <div style="margin-top:4px;">
+          <div class="infra-item">
+            <div class="step-num" style="background:rgba(255,77,109,.2);color:var(--red);border:1px solid rgba(255,77,109,.4);">1</div>
+            <div><div class="infra-key">Enable prefix caching</div><div class="infra-val">remove --no-enable-prefix-caching</div></div>
+          </div>
+          <div class="infra-item">
+            <div class="step-num" style="background:rgba(0,212,255,.1);color:var(--cyan);border:1px solid rgba(0,212,255,.3);">2</div>
+            <div><div class="infra-key">FP8 KV cache</div><div class="infra-val">--kv-cache-dtype fp8 → 60GB/GPU</div></div>
+          </div>
+          <div class="infra-item">
+            <div class="step-num" style="background:rgba(0,212,255,.1);color:var(--cyan);border:1px solid rgba(0,212,255,.3);">3</div>
+            <div><div class="infra-key">FP8 weights</div><div class="infra-val">Qwen3-Coder-Next-FP8 → 107GB/GPU</div></div>
+          </div>
+          <div class="infra-item">
+            <div class="step-num" style="background:rgba(167,139,250,.1);color:var(--purple);border:1px solid rgba(167,139,250,.3);">4</div>
+            <div><div class="infra-key">overlap_score_weight</div><div class="infra-val">1.0 → 2.0–5.0 (coding workload)</div></div>
+          </div>
+          <div class="infra-item">
+            <div class="step-num" style="background:rgba(167,139,250,.1);color:var(--purple);border:1px solid rgba(167,139,250,.3);">5</div>
+            <div><div class="infra-key">Speculative decoding</div><div class="infra-val">qwen3_next_mtp method</div></div>
+          </div>
+          <div class="infra-item" style="border-bottom:none;">
+            <div class="step-num" style="background:rgba(0,255,157,.1);color:var(--green);border:1px solid rgba(0,255,157,.3);">6</div>
+            <div><div class="infra-key">P/D disaggregation</div><div class="infra-val">if TTFT still unacceptable</div></div>
+          </div>
+        </div>
+      </div>
+
+    </div>
+  </div>
+
+  <footer>
+    NVIDIA Dynamo · vLLM v0.16 · Qwen3-Coder-Next on B200 · sc09super22-b200
+  </footer>
+
+</div>
+
+<script>
+function setMode(mode) {
+  document.querySelectorAll('.mode-btn').forEach(b => b.classList.remove('active'));
+  event.target.classList.add('active');
+  if (mode === 'disagg') {
+    document.body.classList.add('disagg');
+    document.querySelectorAll('.kv-xfer').forEach(el => el.style.display = 'flex');
+    document.querySelectorAll('.agg-only').forEach(el => el.style.opacity = '1');
+  } else {
+    document.body.classList.remove('disagg');
+    document.querySelectorAll('.kv-xfer').forEach(el => el.style.display = 'none');
+    document.querySelectorAll('.agg-only').forEach(el => el.style.opacity = '');
+    // reset agg-only decode worker
+    document.querySelectorAll('.box.agg-only').forEach(el => el.style.opacity = '0.25');
+  }
+}
+</script>
+</body>
+</html>
