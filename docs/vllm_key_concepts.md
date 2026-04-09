@@ -518,13 +518,21 @@ Discard: "the" (was after rejection point)
 
 This is mathematically exact — the acceptance/rejection scheme guarantees the final output distribution is **identical** to what you'd get from the large model alone. No quality loss.
 
-vLLM supports three draft methods:
+**Draft method taxonomy** — vLLM supports several ways to produce the speculative tokens, with very different cost/accept-rate tradeoffs:
 
-1. **`draft_model`** — A separate smaller model (e.g., Llama-3-8B drafting for Llama-3-70B). Both loaded in GPU memory simultaneously.
-2. **`ngram`** — No neural network. Looks at patterns in the prompt text to guess next tokens. Zero extra memory cost.
-3. **`ngram_gpu`** — GPU-accelerated version of the ngram approach.
+| Method | Draft source | Extra VRAM | Accept rate | Best for |
+|---|---|---|---|---|
+| **`ngram`** | Look up repeated substrings from the prompt/output | ~0 | High on repetitive text | Code editing, structured output, long repeats |
+| **`ngram_gpu`** | GPU-accelerated ngram lookup | ~0 | Same as ngram | Same, but with less CPU overhead |
+| **`draft_model`** | A separate smaller model (e.g. Llama-3-8B drafting for 70B) | 1 full model | Medium–high | General prose when a good small model exists |
+| **EAGLE / EAGLE-3** | A tiny auto-regressive head trained on the target's hidden states | Small head only | High (trained to match target) | Production decode speedup across prompts |
+| **Medusa** | Multiple extra LM heads that each predict the *k*-th next token | Small head(s) | Medium | Decode speedup without a second model |
+| **MTP (multi-token prediction)** | Extra MTP head shipped with the base model (DeepSeek-V3/R1) | Built into the checkpoint | High | DeepSeek-V3/R1 — free speedup, no extra weights to pick |
+
+Rule of thumb: if the workload is repetitive (code, JSON, structured output) start with `ngram` — it costs nothing. For conversational / creative workloads on DeepSeek-V3/R1, enable MTP. Otherwise EAGLE is the strongest trained-head option; a separate draft model is a simpler but memory-hungry fallback.
 
 Example usage:
+
 ```bash
 vllm serve meta-llama/Llama-3-70B \
     --speculative-model meta-llama/Llama-3-8B \
@@ -614,18 +622,23 @@ The `scale` and `zero_point` are stored alongside the quantized weights. During 
 
 **Methods supported in vLLM:**
 
-| Method | Bits | How it works |
-|---|---|---|
-| **FP8** | 8-bit float | Uses FP8 format (E4M3/E5M2), hardware-native on H100+ |
-| **INT8** | 8-bit int | SmoothQuant-style, per-channel scaling |
-| **GPTQ** | 4/3/2-bit | Calibration-based, minimizes layer-wise quantization error |
-| **AWQ** | 4-bit | Identifies "salient" weights and protects them during quantization |
-| **AutoRound** | 4-bit | Sign gradient descent-based quantization |
-| **BitsAndBytes** | 4/8-bit | NF4/INT8 with double quantization |
+| Method | Bits | Weights / Activations | Hardware | How it works |
+|---|---|---|---|---|
+| **FP8** | 8-bit float | W8A8 or W8A16 | H100+, B200 | E4M3/E5M2 format, hardware-native on Hopper/Blackwell |
+| **NVFP4** | 4-bit float | W4A4 | B200 (Blackwell) | Native FP4 tensor cores — highest throughput per byte |
+| **MXFP4** | 4-bit float | W4A4 (microscaled) | B200 | OCP microscaling format, shared group scales |
+| **INT8** | 8-bit int | W8A8 | Broad | SmoothQuant-style per-channel scaling |
+| **GPTQ** | 4/3/2-bit | W4A16 (weight-only) | Broad | Calibration-based, minimizes layer-wise error |
+| **AWQ** | 4-bit | W4A16 (weight-only) | Broad | Protects "salient" weights during quantization |
+| **AutoRound** | 4-bit | W4A16 | Broad | Sign-gradient-descent quant |
+| **BitsAndBytes** | 4/8-bit | W4A16 / W8A16 | Broad | NF4 / INT8 with double quantization |
 
-**Weight-only vs Weight+Activation**:
-- **Weight-only** (GPTQ, AWQ): only weights are quantized; activations stay in fp16. Saves memory, less speedup.
-- **Weight+Activation** (FP8, INT8): both quantized. Saves memory AND speeds up matrix multiply (GPU has specialized int8/fp8 tensor cores).
+**Weight-only vs Weight+Activation** — a second, orthogonal axis:
+
+- **W4A16 / W8A16 (weight-only)** — GPTQ, AWQ, BitsAndBytes, AutoRound. Activations stay in fp16/bf16. Saves memory, but GEMM still runs at fp16 rates. Best when you are **memory-bound** (fit a bigger model) more than compute-bound.
+- **W8A8 / W4A4 (weight + activation)** — FP8, INT8, NVFP4, MXFP4. Both sides quantized. Saves memory **and** lights up the GPU's int8/fp8/fp4 tensor cores — big compute speedup on Hopper/Blackwell. Best when the GPU has native low-precision tensor cores.
+
+On **B200** specifically, NVFP4/MXFP4 are the new sweet spot: 4-bit weights *and* 4-bit activations running on native FP4 tensor cores, with calibration-based scaling keeping quality close to FP8.
 
 Quantized checkpoints are typically **pre-quantized offline** (not by vLLM) and saved in quantized form. vLLM loads the INT4/FP8 weights directly and dequantizes on-the-fly during inference. Exception: FP8 can also be quantized online at startup.
 
@@ -971,6 +984,32 @@ vllm serve <MODEL> --kv-transfer-config \
 # Or both roles in one instance:
   '{"kv_connector":"NixlConnector", "kv_role":"kv_both"}'
 ```
+
+**XpYd topology** — in production, you typically don't run 1 prefill + 1 decode. You run **x prefill instances** and **y decode instances** behind a router, scaling each pool to the workload:
+
+```
+         ┌──────────────┐
+         │   Router     │
+         └──────┬───────┘
+                │
+     ┌──────────┼──────────┐
+     ▼          ▼          ▼
+  ┌─────┐   ┌─────┐    ┌─────┐
+  │  P0 │   │  P1 │    │  P2 │      x prefill instances
+  └──┬──┘   └──┬──┘    └──┬──┘      (optimized for TTFT, high TP)
+     │         │          │
+     │   KV blocks via NIXL (many-to-many)
+     │         │          │
+     ▼         ▼          ▼
+  ┌─────┐   ┌─────┐    ┌─────┐
+  │  D0 │   │  D1 │    │  D2 │      y decode instances
+  └─────┘   └─────┘    └─────┘      (optimized for ITL, many concurrent seqs)
+```
+
+- Prefill pool is sized by **input-token QPS** (compute-bound).
+- Decode pool is sized by **concurrent active sequences × output length** (memory-bound).
+- The NIXL connector (§12) handles the many-to-many transfer: a given prefill instance can hand off to any decode instance the router chooses.
+- Router strategies: round-robin, least-loaded, sticky-by-conversation-id (for long multi-turn chats that benefit from prefix caching on one specific decode instance).
 
 ### The Constraint
 
@@ -1356,9 +1395,15 @@ temperature = 1.5:  high randomness (creative writing)
 top_k = 50:     only consider top 50 tokens, zero out the rest
 top_p = 0.9:    only consider tokens whose cumulative probability reaches 90%
 min_p = 0.05:   only consider tokens with probability ≥ 5% of the top token
+typical_p = 0.95:  "locally typical" filter; keeps tokens whose surprisal is
+                   close to the distribution's conditional entropy
 
-These filters stack: top_k first, then top_p, then sample from what remains.
+These filters stack: top_k first, then top_p / min_p / typical_p, then sample.
 ```
+
+**min-p vs top-p**: top-p's cutoff moves with the distribution's shape (a flat distribution keeps many tokens; a peaked one keeps few). **min-p** is defined relative to the top token's probability — it keeps tokens whose probability is at least `min_p × P(top)`. This is more robust when temperature is high: top-p can still sample rare garbage on flat distributions, while min-p tightens proportionally.
+
+**Custom logits processors** — users can attach arbitrary Python functions that mutate the logits tensor before the filter stack, via `SamplingParams.logits_processors`. Typical uses: banned-token lists with complex rules, classifier-guided sampling, external grammar constraints. Everything in the filter pipeline (penalties, bitmask from structured output §15, user logits processors) is implemented as a logits processor — they form a single ordered pipeline that runs on every step.
 
 **Greedy shortcut:** If ALL requests in the batch use temperature=0, the sampler skips the entire random sampling path and does a single argmax — much faster.
 
@@ -1726,9 +1771,20 @@ Scheduler preempts C (lowest priority):
   4. Allocate freed blocks for D
 ```
 
+**Preemption policies** — two modes, with very different costs:
+
+| Policy | What happens | Cost to restart | When used |
+|---|---|---|---|
+| **RECOMPUTE** (default in v1) | Discard KV, re-prefill from scratch on restart | O(prompt_len) compute | Always in v1 — simpler, works with paged KV + prefix caching |
+| **SWAP** (legacy) | Copy KV blocks to host RAM, copy back on restart | O(prompt_len × dtype) PCIe bandwidth | v0 only; rarely faster than recompute on modern GPUs |
+
+Because prefix caching (§4) can rescue much of the recomputed prefix for free, RECOMPUTE is usually the right choice — especially when the preempted request shares its system prompt with active ones.
+
 **Scheduling policies:**
-- **FCFS** (First-Come-First-Served): fair, simple, default
-- **Priority**: min-heap ordered by `(priority, arrival_time)`, supports priority-based preemption
+- **FCFS** (First-Come-First-Served): fair, simple, default. Short requests can get stuck behind a long-context prefill.
+- **Priority**: min-heap ordered by `(priority, arrival_time)`. Higher-priority arrivals can preempt lower-priority running requests. Good for mixed SLAs (e.g. interactive chat + batch jobs), but requires a trusted priority source — clients can't be allowed to set their own priority.
+
+**DBO hook point** — when `--enable-dbo` (§31) is set, the scheduler's output batch is passed to the model runner, which then splits it into two micro-batches inside `execute_model`. The scheduler itself is unchanged; DBO is a worker-level transformation that kicks in after scheduling, conditional on the batch exceeding the DBO token thresholds.
 
 **Budget limits enforced per iteration:**
 - `max_num_running_reqs` — max concurrent requests
@@ -1855,6 +1911,22 @@ Available backends:
 | **FlashInfer MLA** | NVIDIA | Multi-head Latent Attention (DeepSeek). |
 | **FlashAttention MLA** | NVIDIA | MLA via FlashAttention kernels. |
 | **Triton MLA** | NVIDIA | MLA via Triton kernels. |
+
+**Decision matrix** — which backend wins in which situation:
+
+| Situation | Backend | Why |
+|---|---|---|
+| Standard attention on H100/B200 | **FlashAttention-3** | Fastest on Hopper/Blackwell for vanilla MHA/GQA |
+| Need FP8 KV cache, cascade attn, sink tokens | **FlashInfer** | Only backend with all three; default for most NVIDIA setups |
+| MLA model (DeepSeek-V2/V3/R1) on H100 | **FlashInfer MLA** | MLA-aware paged kernel, highest throughput |
+| MLA model on B200 | **FlashMLA** | Blackwell-tuned MLA path |
+| Older GPU (SM 7.5 / T4 / A10) | **FlashInfer** or **Triton** | FlashAttention-3 requires Hopper+ |
+| No CUDA toolkit / pure PyTorch build | **Triton Attention** | No CUDA kernel dependency |
+| AMD MI300/MI325 | **ROCm Attention** | AMD-optimized, uses CK/AITER |
+| CPU fallback / debugging | **CPU Attention** | Correctness reference, very slow |
+| Sliding-window models (Mistral, Gemma) | **FlashAttention** or **FlashInfer** | Both support SWA; check the specific version |
+
+In practice: let vLLM auto-pick, override with `--attention-backend` only when you need a specific feature (FP8 KV, MLA variant).
 
 **Backend selection** happens automatically based on:
 1. Hardware (CUDA capability, AMD, CPU)
@@ -2089,3 +2161,834 @@ Send load, collect metrics
 ```
 
 **vLLM code**: `vllm/v1/metrics/loggers.py` (all metric definitions), `vllm/v1/metrics/stats.py` (TTFT/ITL tracking), `vllm/config/scheduler.py` (batching config), `vllm/config/cache.py` (KV cache config).
+
+---
+
+## 23. EngineCore & AsyncLLM (Multi-Process Engine)
+
+### The Problem
+
+A naive single-process server has an unavoidable conflict: the HTTP handler, the tokenizer, the scheduler, and the GPU step loop all want to run on the same Python thread. Every incoming request competes with the GIL-held engine step, and a slow tokenize on a long prompt blocks tokens from streaming out. Adding `asyncio` helps at the HTTP layer, but the engine's `step()` is a synchronous blocking call into CUDA that will still stall coroutines.
+
+### The Solution
+
+Split the engine into two (or more) processes:
+
+- **API server process** — runs FastAPI / OpenAI endpoints, tokenization, detokenization, per-request `asyncio.Queue`s. This is `AsyncLLM`.
+- **EngineCore process** — runs the scheduler + model executor + worker(s). Loops forever: poll input queue → `schedule()` → `execute_model()` → push outputs.
+
+They communicate over **ZMQ sockets** (in-process or TCP), not Python function calls. This is what lets the HTTP server serve 1000+ concurrent requests while the engine runs a tight GPU step loop.
+
+### How It Works
+
+```
+  HTTP client
+      │ POST /v1/chat/completions
+      ▼
+┌──────────────────────────┐           ZMQ PUSH/PULL           ┌──────────────────────────┐
+│  API server process      │  ─── EngineCoreRequest ──────►    │  EngineCore process      │
+│  ──────────────────────  │                                    │  ──────────────────────  │
+│  FastAPI routes          │                                    │  while True:             │
+│  Tokenizer               │                                    │    get new reqs          │
+│  AsyncLLM.generate():    │                                    │    scheduler.schedule()  │
+│    put req on out queue  │                                    │    executor.execute()    │
+│    yield tokens as they  │                                    │    push outputs          │
+│    arrive                │  ◄── EngineCoreOutput (per req) ── │                          │
+│  Detokenizer             │                                    │                          │
+│  SSE stream back         │                                    │                          │
+└──────────────────────────┘                                    └──────────────────────────┘
+```
+
+- **DP > 1**: one `EngineCore` process per DP rank, coordinated by `DPCoordinator`.
+- **TP > 1**: the `EngineCore` process spawns N worker processes (one per TP rank) via `MultiprocExecutor`; TP is internal to the engine, invisible to the API server.
+- **Backpressure**: ZMQ queue bounded. If the engine falls behind, the API server sees queue pressure and can shed load.
+- **`LLM` offline class**: uses the same `EngineCore`, but runs it in-process for batch scripts where there's no HTTP server.
+
+### The Constraint
+
+- Every message across the ZMQ boundary is **serialized** (msgpack). Large multimodal inputs (images, video) must be serialized carefully — vLLM uses shared memory / pickle for tensor payloads to avoid copying.
+- The two processes must agree on config. `VllmConfig` is pickled once at startup and sent to `EngineCore`; mismatched versions will deserialize wrong.
+- Failure in `EngineCore` (CUDA OOM, illegal memory access) kills that process. The API server detects the dead socket and must re-raise cleanly to all pending requests, otherwise they hang forever.
+- Debugging is harder — you need to attach to the right PID. `VLLM_ENABLE_V1_MULTIPROCESSING=0` falls back to in-process mode for debugging.
+
+### The Tradeoff
+
+| Mode | Pro | Con |
+|---|---|---|
+| **Multi-process (default)** | No GIL contention, isolates engine crashes, scales DP | IPC overhead, harder to debug |
+| **In-process** (`VLLM_ENABLE_V1_MULTIPROCESSING=0`) | Simple, easy to debug | Tokenizer / HTTP compete with engine step under load |
+
+For production serving, multi-process is always correct. For unit tests and profiling, in-process is clearer.
+
+### Connection to Everything Else
+
+- **Scheduler (§19)**: lives inside `EngineCore`. The API server never touches it directly.
+- **Tokenizer (§24) / Detokenizer (§25)**: live in the API server, not `EngineCore` — that's why large concurrent requests don't stall the GPU step.
+- **Continuous Batching (§3)**: the `EngineCore` loop is what makes per-iteration batch updates possible.
+- **Executor**: `EngineCore` picks `UniprocExecutor` / `MultiprocExecutor` / `RayExecutor` based on TP/PP config.
+
+**vLLM code**: `vllm/v1/engine/core.py` (`EngineCore` loop), `vllm/v1/engine/core_client.py` (ZMQ client), `vllm/v1/engine/async_llm.py` (`AsyncLLM`), `vllm/v1/engine/llm_engine.py` (sync wrapper), `vllm/v1/engine/coordinator.py` (DP coordination).
+
+---
+
+## 24. Tokenizer & Chat Templates
+
+### The Problem
+
+The model speaks in token IDs, not strings. Between "Hello, how are you?" and a tensor of integers lies a pile of complexity: BPE/SentencePiece vocab, special tokens (`<s>`, `<|im_start|>`), per-model chat formats, system prompts, tool schemas, and multimodal placeholders. Getting any of this wrong silently produces a model that "works" but outputs garbage.
+
+### The Solution
+
+A two-layer pipeline:
+
+1. **Chat template layer** — converts a structured `messages` list (+ tools, + images) into a single prompt string using the model's **Jinja2 chat template** (shipped in `tokenizer_config.json`).
+2. **Tokenizer layer** — converts the prompt string to token IDs using the HF `AutoTokenizer`, Mistral's custom tokenizer, or a model-specific fast path.
+
+### How It Works
+
+```
+Request body:
+  messages = [
+    {"role": "system", "content": "You are helpful."},
+    {"role": "user",   "content": "What's 2+2?"}
+  ]
+  tools = [{"type": "function", "function": {...}}]
+        │
+        ▼
+apply_chat_template(messages, tools, add_generation_prompt=True)
+        │
+        ▼  (Jinja renders the model's template)
+"<|im_start|>system\nYou are helpful.\n[tools: {...}]<|im_end|>
+ <|im_start|>user\nWhat's 2+2?<|im_end|>
+ <|im_start|>assistant\n"
+        │
+        ▼
+tokenizer.encode(...)
+        │
+        ▼
+[1, 32001, 9125, ...]  →  handed to EngineCore
+```
+
+Key behaviors:
+
+- **`add_generation_prompt=True`** appends the assistant turn header so the model knows it's its turn to speak.
+- **Tool schemas** are serialized into the prompt by the chat template — no special model API, just text.
+- **Multimodal**: image/audio placeholders (`<image>`, `<|audio|>`) are inserted by the template; the actual pixels are attached separately and resolved by the multimodal processor (§17).
+- **Mistral tokenizer** (`--tokenizer-mode mistral`) bypasses Jinja entirely and uses Mistral's native `ChatCompletionRequest` → tokens path.
+- **Custom templates** can be passed via `--chat-template path/to/template.jinja` or the `chat_template` request field to override a model's baked-in template.
+- The tokenizer lives in the **API server process** (§23), not `EngineCore`, so tokenization never blocks the GPU step.
+
+### The Constraint
+
+- Chat templates are model-specific and often buggy upstream. A wrong template can silently produce wrong-format prompts (e.g., missing `<|eot_id|>` on Llama 3) and terrible outputs.
+- Jinja rendering is pure Python and can be slow for very long conversations — tokenizing a 100k-token chat takes real time.
+- Tool-calling templates vary wildly: Hermes, Llama 3 JSON, Mistral, Pythonic, Granite — each expects a different tool-schema serialization (§28).
+- Special-token handling is fragile. Adding a BOS twice (once by template, once by tokenizer) changes outputs.
+
+### The Tradeoff
+
+- **Baked-in template** (default): correct for most users, zero setup.
+- **Override template** (`--chat-template`): needed for fine-tuned variants that changed the format, or to inject custom system prompts — but easy to get wrong.
+
+### Connection to Everything Else
+
+- **AsyncLLM (§23)**: tokenizer runs in the API server, isolated from the engine loop.
+- **Tool Calling (§28)**: tool schema injection happens here; the tool parser later reverses it.
+- **Reasoning Models (§29)**: thinking-token delimiters (`<think>`) are part of the template.
+- **Multi-Modal (§17)**: template inserts image/audio placeholders that the multimodal processor replaces with feature tokens.
+- **Prefix Caching (§4)**: because the template is deterministic, repeated system prompts hit the prefix cache perfectly.
+
+**vLLM code**: `vllm/transformers_utils/tokenizer.py` (tokenizer loading, Mistral path), `vllm/entrypoints/chat_utils.py` (`apply_chat_template`, multimodal placeholder expansion), `vllm/transformers_utils/chat_templates/` (shipped overrides).
+
+---
+
+## 25. Detokenizer & Streaming Output
+
+### The Problem
+
+The engine outputs token IDs one at a time. Users want **text**, streamed as it's produced, with correct handling of:
+
+- Multi-byte UTF-8 characters (one token may be half of an emoji).
+- BPE merge boundaries (` hello` vs `hello` differ by a leading space).
+- Stop strings that span multiple tokens (`"</answer>"` might be 3 tokens).
+- `include_stop_str_in_output=False` — the stop string must be removed from the final delta.
+- OpenAI-style **delta** streaming, where each SSE event contains only the new text since the last event.
+
+Calling `tokenizer.decode(all_tokens_so_far)` every step is both slow and wrong (it can flip characters as new tokens arrive).
+
+### The Solution
+
+An **incremental detokenizer** that keeps per-request state: the list of generated token IDs, a prefix offset, and a read offset. Each new token triggers a bounded-window decode that emits only the new text delta, buffering any partial-character bytes until they complete.
+
+### How It Works
+
+```
+request state:
+  token_ids      = [...previous..., new_token]
+  prefix_offset  = index of last "safe" prefix start
+  read_offset    = how much text has already been emitted
+
+on new token:
+  decoded_text = tokenizer.decode(token_ids[prefix_offset:])
+  if decoded_text ends in an incomplete UTF-8 sequence:
+      buffer and wait for next token
+  else:
+      new_delta = decoded_text[read_offset_within_window:]
+      read_offset += len(new_delta)
+      yield new_delta
+
+on stop-string match:
+  trim the matched suffix if include_stop_str_in_output is False
+  mark request finished
+```
+
+Important details:
+
+- The detokenizer runs in the **API server process** (§23), reading `EngineCoreOutput` messages from the engine.
+- **Stop-string detection** requires keeping a small tail buffer (`max(len(stop) for stop in stops)` characters) so that a stop can be detected even if it crosses token boundaries.
+- **Logprobs** go through the same path — token IDs in logprob objects are detokenized lazily to text.
+- For non-streaming requests, the detokenizer still runs incrementally but only returns text once the request finishes.
+
+### The Constraint
+
+- Some tokenizers (especially SentencePiece) treat the first token's leading space specially. The detokenizer has to know this or the first word will be missing a space.
+- Stop strings that overlap special-token boundaries (e.g., `"<|eot_id|>"` as text) can mis-fire if the model emits the actual special token ID.
+- CJK text plus BPE merges means the "one token = one character" assumption is wrong — a single Chinese character can be 1-4 tokens.
+- Per-request Python state means the detokenizer is not vectorizable on GPU — it's CPU-bound, but cheap.
+
+### The Tradeoff
+
+- **Incremental detokenization** — correct streaming, low per-step cost, complex state.
+- **Full re-decode each step** — trivial to implement, but O(n²) total work and can flip already-emitted characters when new bytes arrive.
+
+vLLM uses incremental; nothing else scales.
+
+### Connection to Everything Else
+
+- **AsyncLLM (§23)**: receives `EngineCoreOutput`, runs detokenizer, pushes deltas to per-request `asyncio.Queue`.
+- **Sampling (§14)**: logprob objects carry token IDs that the detokenizer converts to text lazily.
+- **Reasoning Models (§29)**: the reasoning parser consumes the detokenized stream to split `<think>` content from the answer.
+- **Tool Calling (§28)**: streaming tool parsers run on top of the detokenized delta stream.
+
+**vLLM code**: `vllm/v1/engine/detokenizer.py` (incremental detokenizer state machine), `vllm/transformers_utils/detokenizer_utils.py` (decode helpers), `vllm/v1/engine/output_processor.py` (glue between `EngineCoreOutput` and per-request async queues).
+
+---
+
+## 26. Weight Loading & Model Loader
+
+### The Problem
+
+A 70B checkpoint can be hundreds of GB, split across dozens of shard files, in any of several formats (`safetensors`, PyTorch `bin`, GGUF, bitsandbytes 4-bit, tensorized blobs, Run:ai streamer format). The loader must:
+
+1. Find and fetch the files (local, HF hub, S3).
+2. Detect the format.
+3. For each TP rank, load **only the slice of each tensor** that rank owns — without ever materializing the full tensor on any single GPU.
+4. Handle quantized weights with their scales / zero-points / packing layouts.
+5. Remap HF parameter names to vLLM layer names.
+
+A loader that reads the whole file into host RAM first is unusable for 400B models.
+
+### The Solution
+
+A pluggable `BaseModelLoader` hierarchy. `ModelConfig.load_format` selects one, and each loader implements `load_weights(model, ...)` that iterates weight tensors and hands them to the model's own `load_weights()` method, which performs the per-rank sharding and name remapping.
+
+### How It Works
+
+```
+VllmConfig.load_format  ─►  get_model_loader()  ─►  BaseModelLoader subclass
+                                                          │
+                                                          ▼
+                                          for each (name, tensor) in checkpoint:
+                                              model.load_weights([(name, tensor)])
+                                                          │
+                                                          ▼
+                                    model iterates its own params, looks up the
+                                    matching HF name in its stacked-param map,
+                                    slices out this rank's shard, copies to GPU
+```
+
+Loader variants:
+
+| Loader | Format | Notes |
+|---|---|---|
+| `default` | `safetensors` / `.bin` | mmap-backed, lazy tensor slicing |
+| `sharded_state` | vLLM's own sharded dump | Used by `save_sharded_state`; instant reload (no resharding) |
+| `tensorizer` | CoreWeave Tensorizer | Streams from S3 directly to GPU, very fast |
+| `runai_streamer` | Run:ai Model Streamer | Parallel S3 → GPU path |
+| `bitsandbytes` | BnB 4/8-bit | Loads packed quantized tensors + absmax scales |
+| `gguf` | GGUF (llama.cpp) | Dequantizes on-the-fly during load |
+| `dummy` | (none) | Random weights for perf testing |
+| `fastsafetensors` | `safetensors` | Faster multi-thread safetensors reader |
+
+**Stacked-param mapping** — HF stores `q_proj`, `k_proj`, `v_proj` as separate tensors; vLLM fuses them into one `qkv_proj`. The model's `stacked_params_mapping` declares this, and the loader assembles the three HF tensors into one vLLM tensor at the right offsets.
+
+**Per-rank sharding** — for a `ColumnParallelLinear(out=4096)` with TP=4, each rank owns `out[rank*1024:(rank+1)*1024]`. The loader knows this and only copies that slice from the checkpoint to that rank's GPU, so total host memory never exceeds one rank's share.
+
+### The Constraint
+
+- The loader must match the model's parameter naming exactly — new model files must register their stacked-param mapping or loading silently skips tensors.
+- Quantized formats each have custom layouts (GPTQ packs 8 int4 values into one int32, AWQ uses a different packing) — the loader and the quant linear layer must agree.
+- Streaming loaders (tensorizer, runai_streamer) require network bandwidth — a 400B model over a slow link is worse than local disk.
+- GGUF dequantization happens at load time, inflating weights to fp16 — defeating most of the GGUF memory savings. Use only for compatibility, not production.
+
+### The Tradeoff
+
+| Loader | Cold start | Memory peak | Setup cost |
+|---|---|---|---|
+| `default` | Slow (disk read) | Low | None |
+| `sharded_state` | Fastest | Low | Requires pre-dump |
+| `tensorizer` / `runai_streamer` | Fast (S3→GPU) | Low | Requires pre-conversion |
+| `bitsandbytes` | Slow (unpack) | Lowest | None |
+
+### Connection to Everything Else
+
+- **TP/PP (§8)**: the loader is the component that actually shards weights across ranks.
+- **Quantization (§7)**: each quant method provides a packed tensor layout that the loader must preserve.
+- **Model Registry (§16)**: registry gives the model class; the loader instantiates it and then fills in weights.
+- **Platform Abstraction (§27)**: on XPU/TPU, loaders must copy to the platform's device instead of `cuda:N`.
+
+**vLLM code**: `vllm/model_executor/model_loader/base_loader.py`, `default_loader.py`, `sharded_state_loader.py`, `tensorizer_loader.py`, `runai_streamer_loader.py`, `bitsandbytes_loader.py`, `gguf_loader.py`, and the per-model `load_weights()` methods inside `vllm/model_executor/models/*.py`.
+
+---
+
+## 27. Platform Abstraction
+
+### The Problem
+
+vLLM runs on NVIDIA CUDA, AMD ROCm, Intel XPU, Google TPU, AWS Neuron, and plain CPU. Each has a different device API, a different preferred attention backend, a different communicator library (NCCL / RCCL / XCCL / gloo), different dtype support, and different CUDA-graph-equivalent capture mechanisms. Hard-coding `torch.cuda.*` everywhere would make vLLM a CUDA-only project.
+
+### The Solution
+
+A `Platform` base class that every backend subclasses. All code that would otherwise touch `torch.cuda` goes through `current_platform` — a module-level handle selected once at import time by auto-detecting the environment.
+
+### How It Works
+
+```
+vllm/platforms/
+├── interface.py     ← Platform ABC
+├── cuda.py          ← CudaPlatform
+├── rocm.py          ← RocmPlatform
+├── xpu.py           ← XPUPlatform
+├── tpu.py           ← TpuPlatform
+├── cpu.py           ← CpuPlatform
+└── neuron.py        ← NeuronPlatform
+
+At import:
+  current_platform = _detect_platform()    # checks torch.cuda.is_available(), hip, xpu, ...
+
+Anywhere in vLLM:
+  from vllm.platforms import current_platform
+  current_platform.synchronize()
+  current_platform.get_attn_backend_cls(...)
+  current_platform.get_device_capability()
+  current_platform.seed_everything(seed)
+```
+
+Each `Platform` subclass answers questions like:
+
+- **Device management**: `device_type`, `device_name`, `synchronize`, `empty_cache`.
+- **Attention backend selection**: which subclass of `AttentionBackend` to return given model features (MLA, sparse, sink tokens).
+- **Communicator choice**: NCCL for CUDA, RCCL for ROCm, gloo for CPU.
+- **Executor choice**: multiproc vs Ray vs uniproc default.
+- **Supported dtypes**: FP8? BF16? INT4?
+- **CUDA-graph equivalent**: `graph_capture()` context manager; CPU/TPU return no-ops.
+- **Quantization support**: which quant methods are actually runnable on this platform.
+
+`VllmConfig` validation also routes through the platform — e.g., `CudaPlatform.check_and_update_config()` can force-disable FP8 on pre-Hopper GPUs.
+
+### The Constraint
+
+- A feature that only exists on one platform (e.g., FP8 KV cache) must either be implemented on the others or the platform must refuse it in `check_and_update_config`.
+- Platform detection happens **once at import**. Changing `CUDA_VISIBLE_DEVICES` after import does not re-detect.
+- Out-of-tree platforms (custom accelerators) register via the plugin system (§33) — they must ship their own `Platform` subclass.
+- Some operations simply don't have platform-neutral wrappers; code near the kernel boundary still does platform-specific dispatch (e.g., `if current_platform.is_cuda(): ...`).
+
+### The Tradeoff
+
+- **Pro**: adding a new hardware backend touches ~10 well-defined methods, not thousands of scattered `torch.cuda.*` calls.
+- **Con**: one more layer of indirection; debugging requires knowing which platform was selected.
+
+### Connection to Everything Else
+
+- **Attention Backends (§21)**: `current_platform.get_attn_backend_cls()` is the entry point for the selection logic documented there.
+- **CUDA Graphs (§9)**: the graph capture context manager is platform-provided; TPU and CPU return no-op contexts.
+- **TP/PP (§8)**: the communicator (NCCL/RCCL/...) is chosen by the platform.
+- **Quantization (§7)**: platforms gate which quant methods can actually run.
+- **Plugin System (§33)**: how out-of-tree accelerators inject their own `Platform` subclass.
+
+**vLLM code**: `vllm/platforms/interface.py` (ABC), `vllm/platforms/__init__.py` (auto-detection), `vllm/platforms/cuda.py`, `rocm.py`, `xpu.py`, `tpu.py`, `cpu.py`, `neuron.py`.
+
+---
+
+## 28. Tool Calling / Function Calling
+
+### The Problem
+
+OpenAI's API lets users pass `tools=[{...}]` and expects the model to emit a structured `tool_calls` field with JSON arguments. But open-weights models weren't trained against one universal format — Hermes uses XML-ish `<tool_call>` tags, Llama 3 JSON uses `{"name":..., "parameters":...}`, Mistral uses its own tekken tokens, Granite uses yet another shape. vLLM needs to expose the OpenAI-compatible endpoint on top of all of them.
+
+### The Solution
+
+A **tool parser** per model family. On the input side, the chat template (§24) formats the provided `tools` into whatever prompt shape the model expects. On the output side, a per-model parser scans the generated text, recognizes tool-call syntax, and re-packs it into the OpenAI `tool_calls` schema. Both a batch (non-streaming) path and a streaming path exist.
+
+### How It Works
+
+```
+Input:  tools=[{function: {name: "get_weather", parameters: {...}}}]
+        │
+        ▼  (chat_utils.apply_chat_template)
+prompt: "... <|tools|>[{\"name\": \"get_weather\", ...}]<|/tools|> ..."
+        │
+        ▼  (model generates)
+raw:    "I'll check the weather.\n<tool_call>{\"name\":\"get_weather\",\"arguments\":{\"city\":\"SF\"}}</tool_call>"
+        │
+        ▼  (ToolParser.extract_tool_calls)
+response: {
+  role: "assistant",
+  content: "I'll check the weather.",
+  tool_calls: [{
+    id: "call_abc",
+    type: "function",
+    function: {name: "get_weather", arguments: "{\"city\": \"SF\"}"}
+  }]
+}
+```
+
+Per-model parsers shipped with vLLM:
+
+| Parser | Models | Format |
+|---|---|---|
+| `hermes` | NousResearch Hermes | `<tool_call>{...}</tool_call>` tags |
+| `llama3_json` | Llama 3.1/3.2 | `{"name":..., "parameters":...}` JSON |
+| `mistral` | Mistral Instruct v0.3+ | `[TOOL_CALLS]` special token + JSON |
+| `pythonic` | Llama 3.2 1B/3B, some fine-tunes | Python-style function calls |
+| `granite` | IBM Granite | `<|tool_call|>` delimiter |
+| `internlm` | InternLM / InternLM2 | XML tags |
+| `jamba` | Jamba 1.5 | Custom |
+| `phi4_mini_json` | Phi-4 mini | JSON |
+
+**Streaming** is harder than batch: the parser must emit incremental `delta.tool_calls` events as tokens arrive, while also knowing when it has passed out of a tool-call region and is back to plain text. Each parser implements `extract_tool_calls_streaming(current_text, delta_text, ...)` that statefully tracks the tool-call boundary.
+
+Selection via CLI:
+
+```bash
+vllm serve <MODEL> \
+  --enable-auto-tool-choice \
+  --tool-call-parser hermes
+```
+
+### The Constraint
+
+- If the model emits malformed JSON inside its tool-call region, the parser returns plain text and the `tool_calls` field is empty — the client then has to retry or reprompt.
+- Streaming parsers are stateful per request and subtle; a bug here shows up as partial or duplicated tool calls mid-stream.
+- Only the model families with shipped parsers "just work". New fine-tunes need either a matching parser, or a custom parser registered via the plugin system.
+- Combining tool calling with structured output (§15) requires coordination — you typically let the parser handle it, or use `--guided-decoding` to constrain arguments to the tool's JSON schema.
+
+### The Tradeoff
+
+- **Shipped parser** — one flag, correct for that family.
+- **Guided decoding on JSON schema** — more robust syntactically (the model can't emit malformed JSON at all) but less expressive (tool choice is still guided via the parser).
+- **Neither** — the model emits tool-call text that the client must parse itself; fine for custom workflows, useless for OpenAI-compatible clients.
+
+### Connection to Everything Else
+
+- **Tokenizer & Chat Templates (§24)**: inject tool schemas into the prompt.
+- **Structured Output (§15)**: can constrain the tool arguments to the declared JSON schema.
+- **Detokenizer (§25)**: streaming tool parsers consume the detokenized delta stream.
+- **Reasoning Models (§29)**: some reasoning models emit tool calls from *inside* the thinking block — parser order matters.
+
+**vLLM code**: `vllm/tool_parsers/` (one file per parser: `hermes_tool_parser.py`, `llama_tool_parser.py`, `mistral_tool_parser.py`, `pythonic_tool_parser.py`, `granite_tool_parser.py`, ...), `vllm/entrypoints/openai/tool_parsers/` (dispatch glue), `vllm/entrypoints/openai/serving_chat.py` (integration with the chat endpoint).
+
+---
+
+## 29. Reasoning Models
+
+### The Problem
+
+Reasoning models (DeepSeek-R1, Qwen3 in "thinking" mode, GPT-OSS, Gemma 4 thinking) emit a long internal monologue before the real answer:
+
+```
+<think>
+Let me work through this step by step. First, ...
+Actually, wait, I should reconsider ...
+</think>
+The answer is 42.
+```
+
+Users usually want both pieces separately — the **thinking** block for transparency/debugging, and the **answer** for their application. They also often want to **hide** the thinking block from end-users while still letting it influence generation. Streaming complicates this: you have to know which side of the `</think>` fence each delta belongs to as it arrives.
+
+### The Solution
+
+Per-model **reasoning parsers** that split the model's raw output into `reasoning_content` and `content`, implementing both a batch and a streaming path. vLLM exposes these as a separate response field so clients can choose what to show.
+
+### How It Works
+
+```
+raw output stream:
+  "<think>Let me think ..." ← reasoning_content delta
+  " about this more."       ← reasoning_content delta
+  "</think>"                ← boundary detected
+  "The answer is 42."       ← content delta
+        │
+        ▼
+Response:
+{
+  "role": "assistant",
+  "reasoning_content": "Let me think ... about this more.",
+  "content": "The answer is 42."
+}
+```
+
+Per-model parsers shipped:
+
+| Parser | Model | Delimiters |
+|---|---|---|
+| `deepseek_r1` | DeepSeek-R1 | `<think>…</think>` |
+| `deepseek_v3` | DeepSeek-V3 (thinking mode) | `<think>…</think>` |
+| `qwen3` | Qwen3 (thinking mode) | `<think>…</think>` (toggle via chat template) |
+| `gptoss` | GPT-OSS | Custom delimiters |
+| `granite` | Granite reasoning variants | `<|reasoning|>…` |
+| `gemma4` | Gemma 4 thinking | Custom tokens |
+| `ernie45` | ERNIE 4.5 thinking | Custom |
+| `hunyuan_a13b` | Hunyuan A13B reasoning | Custom |
+
+Selection via CLI:
+
+```bash
+vllm serve deepseek-ai/DeepSeek-R1 \
+  --reasoning-parser deepseek_r1
+```
+
+Streaming: the parser keeps a small tail buffer so a split like `"</thi" + "nk>"` still detects the boundary correctly. On each delta, it returns `(reasoning_delta, content_delta)` and the serving layer emits separate SSE events.
+
+### The Constraint
+
+- Thinking blocks can be **very long** (thousands of tokens), which makes every request slower and consumes KV cache proportionally. Budgeting `max_tokens` vs thinking length is a user concern.
+- If the model never closes its `<think>` block before hitting `max_tokens`, the answer never arrives — the parser must handle "still inside thinking" as a valid terminal state.
+- Prefix caching (§4) is helpful here: repeated system prompts + shared context mean the model skips re-thinking the same setup, but the thinking block itself is rarely cacheable since it's unique per prompt.
+- Some reasoning modes are toggled via the chat template (Qwen3, DeepSeek-V3), not via a separate model — the parser must match the template's setting.
+
+### The Tradeoff
+
+- **Expose both** `reasoning_content` and `content`: best for transparency and debugging, but the client has to handle both.
+- **Suppress** `reasoning_content` on the wire: cleaner API surface, but you pay the full generation cost with no visibility.
+- **Cap thinking tokens** (via stop strings or max-tokens budgets): faster, cheaper, but can cut off the reasoning and hurt quality.
+
+### Connection to Everything Else
+
+- **Detokenizer (§25)**: reasoning parsers sit on top of the detokenized delta stream.
+- **Tool Calling (§28)**: reasoning models sometimes emit tool calls from *inside* the thinking block. Parser order matters — typically reasoning first, then tool parsing on the final answer.
+- **Prefix Caching (§4)**: system-prompt reuse wins; thinking-content reuse does not.
+- **Sampling (§14)**: higher temperature in the thinking block vs the answer is a current research area; vLLM supports separate `SamplingParams` but not yet per-region temperature.
+
+**vLLM code**: `vllm/reasoning/` (one file per parser: `deepseek_r1_reasoning_parser.py`, `qwen3_reasoning_parser.py`, `gptoss_reasoning_parser.py`, `granite_reasoning_parser.py`, `gemma4_reasoning_parser.py`, `ernie45_reasoning_parser.py`, `hunyuan_a13b_reasoning_parser.py`), `vllm/reasoning/abs_reasoning_parsers.py` (base class), `vllm/entrypoints/openai/serving_chat.py` (integration).
+
+---
+
+## 30. Sleep Mode
+
+### The Problem
+
+RLHF training loops (PPO, GRPO, DPO-with-rollouts) alternate between two phases:
+
+1. **Rollout**: use vLLM to generate responses with the current policy weights.
+2. **Training**: update the policy weights with a separate training framework.
+
+Between rollouts the vLLM instance is idle but still holding ~140 GB of GPU memory for a 70B model. On a shared GPU, that memory can't be used by the trainer. Tearing down and re-initializing vLLM every rollout is too slow — CUDA graph capture and `torch.compile` alone cost 30-120 s per startup.
+
+### The Solution
+
+A `sleep()` / `wake_up()` API that uses a **custom CUDA memory allocator** (`cumem`) to keep vLLM's `VirtAddress` pages mapped while releasing their backing **physical memory** to the trainer — or, more aggressively, discarding even the weights so the trainer can reuse that memory too.
+
+### How It Works
+
+```
+Active:
+  vLLM holds [weights | KV cache | activations] on GPU
+
+LLM.sleep(level=1):
+  ├── save weights to pinned host memory
+  ├── discard KV cache
+  ├── release physical GPU memory back to the allocator pool
+  └── keep CUDA context, graphs, compiled code alive
+
+  → trainer runs, uses freed GPU memory
+
+LLM.wake_up():
+  ├── reallocate physical GPU memory
+  ├── copy weights back from pinned host memory
+  └── ready to generate — no recompile, no re-capture
+```
+
+Two levels:
+
+| Level | Frees | Wake-up cost | Use case |
+|---|---|---|---|
+| `level=1` | KV cache + physical backing, **weights saved to host** | Fast (HtoD weight copy) | Trainer needs GPU memory but policy weights are unchanged across sleep |
+| `level=2` | Everything including weights | Slow (reload from disk/host) | Trainer will **update** the weights anyway — no point saving them |
+
+Usage:
+
+```python
+from vllm import LLM, SamplingParams
+
+llm = LLM(model=..., enable_sleep_mode=True)
+
+# rollout phase
+outputs = llm.generate(prompts, SamplingParams(...))
+
+# training phase — give GPU memory back
+llm.sleep(level=1)    # weights preserved
+trainer.step()         # uses freed memory
+llm.wake_up()          # ready for next rollout
+```
+
+And for the "trainer updates the weights" case:
+
+```python
+llm.sleep(level=2)                          # discard everything
+trainer.step(policy_weights)
+llm.wake_up(updated_weights=new_weights)    # push new weights back
+```
+
+### The Constraint
+
+- Requires `enable_sleep_mode=True` at engine construction — the custom `cumem` allocator has to be installed before any CUDA allocation.
+- Only supported on CUDA. ROCm/XPU/TPU do not yet have the equivalent allocator.
+- `level=1` still pays host-RAM cost: weights are pinned in CPU memory while sleeping.
+- Interacts poorly with other custom allocators — you can't combine sleep mode with external memory managers.
+- Wake-up is not free — weight copy + re-warm of CUDA graphs can be several seconds for large models.
+
+### The Tradeoff
+
+| Strategy | GPU freed | Wake cost | When to use |
+|---|---|---|---|
+| **No sleep** | None | 0 | Dedicated inference server |
+| **Teardown + rebuild** | All | 30-120 s | Rarely switching workloads |
+| **sleep level=1** | KV + activations | ~seconds | RLHF where weights don't change during sleep |
+| **sleep level=2** | Everything | ~tens of seconds | RLHF where trainer updates weights |
+
+### Connection to Everything Else
+
+- **PagedAttention (§2) / KV Cache (§1)**: the KV cache is the biggest thing sleep frees.
+- **CUDA Graphs (§9) / torch.compile (§20)**: sleep keeps these captured artifacts alive so wake-up is fast. A full teardown loses them.
+- **Weight Loading (§26)**: `level=2` + `wake_up(updated_weights=...)` is essentially a hot path through the loader.
+- **Platform Abstraction (§27)**: only CUDA implements sleep today; other platforms must no-op or error.
+
+**vLLM code**: `vllm/device_allocator/cumem.py` (custom allocator + sleep/wake primitives), `vllm/entrypoints/llm.py` (`LLM.sleep` / `LLM.wake_up` public API), `vllm/v1/engine/core.py` (engine-side sleep handling).
+
+---
+
+## 31. Dual Batch Overlap (DBO)
+
+### The Problem
+
+In multi-GPU TP serving, every layer ends with an `AllReduce` across ranks. The matmul runs on the tensor cores while the `AllReduce` runs on NVLink / NVSwitch. These are **different physical units** on the GPU and the NIC/interconnect — but with a single batch, the kernel launches serialize them: compute, then comms, then compute, then comms. The tensor cores sit idle during comms and vice versa.
+
+Chunked prefill (§5) already mixes prefill and decode within one batch, but all of that batch still goes through one forward pass — the comms gap remains.
+
+### The Solution
+
+**Split the batch into two micro-batches and run them out-of-phase**, so that while micro-batch A is doing its layer-*k* `AllReduce`, micro-batch B is doing its layer-*k* matmul. The two micro-batches "weave through" the model, each hiding the other's comms behind its own compute.
+
+### How It Works
+
+```
+Single batch (before DBO):
+  layer k: [ matmul A ][ allreduce A ][ matmul A' ][ allreduce A' ] ...
+           compute      comms          compute      comms
+                           ↑ tensor cores idle
+
+Two micro-batches with DBO:
+  layer k:
+    A: [ matmul A    ][ allreduce A ][ ... ]
+    B:             [ matmul B    ][ allreduce B ][ ... ]
+                       ↑ A's comms overlaps B's compute
+```
+
+Key points:
+
+- Triggered by `--enable-dbo`. Thresholds `--dbo-prefill-token-threshold` and `--dbo-decode-token-threshold` decide whether the current batch is big enough to benefit from splitting (below the threshold, overhead dominates).
+- The scheduler (§19) still builds one batch per step; DBO is a **worker-level** transformation that splits that batch into two before running the model forward.
+- Works best when the TP degree is high (so comms are expensive) and the interconnect is fast enough that comms and compute are roughly balanced — i.e., Hopper/Blackwell with NVLink 4/5.
+- Distinct from **chunked prefill** (§5), which splits one long prefill into chunks across iterations, and from **pipeline parallelism** (§8), which overlaps across layers on different GPUs. DBO overlaps **within a layer, within one iteration**, across two halves of the same batch.
+
+### The Constraint
+
+- Adds bookkeeping overhead. Small batches get **slower** with DBO because the extra launches outweigh the overlap win — hence the thresholds.
+- Both micro-batches must go through the same CUDA graph shape or graphs have to be captured twice.
+- Harder to reason about for debugging — profiler traces show two interleaved streams of the same model.
+- Not all attention backends (§21) support DBO; the backend must tolerate two half-batches sharing the block table.
+
+### The Tradeoff
+
+| Regime | DBO impact |
+|---|---|
+| Small batch, cheap comms | **Negative** (overhead > win) |
+| Large batch, expensive comms (TP=4–8, H100/B200) | **Positive**, hides AllReduce cost |
+| Bandwidth-bound decode on many GPUs | **Positive** |
+| Single-GPU (no comms) | **Neutral / negative** |
+
+Rule of thumb: enable DBO only when `num_requests_running` consistently exceeds `dbo-*-token-threshold` and TP ≥ 2.
+
+### Connection to Everything Else
+
+- **TP (§8)**: DBO's whole purpose is hiding TP `AllReduce` behind compute.
+- **Scheduler (§19)**: supplies batches large enough to split.
+- **CUDA Graphs (§9)**: must capture the two-micro-batch shape.
+- **torch.compile (§20)**: `fuse_gemm_comms` is a complementary approach — it fuses one matmul + its own comms, instead of overlapping with another batch. Both can be used together.
+- **Performance Metrics (§22)**: `num_requests_waiting` high + GPU underutilized is the signature to try DBO.
+
+**vLLM code**: `vllm/v1/worker/gpu_model_runner.py` (DBO execution paths, micro-batch splitting), `vllm/config/parallel.py` (`enable_dbo`, thresholds), `vllm/distributed/` (the AllReduce that DBO hides).
+
+---
+
+## 32. Long Context & RoPE Scaling
+
+### The Problem
+
+Most base models are pretrained at a modest context length (Llama 3 at 8k, Qwen2 at 32k), but users want to serve 128k, 200k, or even 1M token contexts. The attention layer can scale to any length, but the **Rotary Positional Embedding (RoPE)** only knows the frequencies it was trained on. At positions beyond the training range, the model's sense of "position" breaks down and outputs degrade to nonsense.
+
+### The Solution
+
+**Extrapolate RoPE to new positions** at load time using one of several scaling schemes. They all rewrite the RoPE frequency table so that positions far beyond the original training length still produce embeddings inside the model's learned distribution. Combined with post-training on long sequences, this unlocks 8k → 128k+ contexts.
+
+### How It Works
+
+RoPE rotates query/key vectors by angles derived from `position × θ_i`, where `θ_i` varies by head dimension. Scaling schemes modify either the **positions**, the **frequencies**, or both:
+
+| Scheme | Idea | Used by |
+|---|---|---|
+| **`linear`** | Compress positions by factor `s`: pretend position *p* is *p/s* | Early long-context fine-tunes |
+| **`dynamic` NTK** | Interpolate RoPE base so low-freq dims stretch more than high-freq | Many community 2x/4x extensions |
+| **`yarn`** | NTK-aware + temperature correction + ramped interpolation; highest quality | Mistral, Qwen, some Llama variants |
+| **`longrope`** | Learned per-dim scaling factors | Phi-3 long-context |
+| **`llama3`** | Llama 3.1's own scheme (combines NTK + smoothing) | Llama 3.1 / 3.2 128k |
+| **`mrope`** | Multimodal RoPE, 3-D position for text + image | Qwen2-VL, Qwen2.5-VL |
+
+vLLM reads the scheme from the model's `config.json` under `rope_scaling`:
+
+```json
+"rope_scaling": {
+  "rope_type": "yarn",
+  "factor": 4.0,
+  "original_max_position_embeddings": 32768
+}
+```
+
+and builds the corresponding rotary embedding variant at model load time. No CLI flag is required for correct behavior; `--max-model-len` just caps how far the scaled RoPE is allowed to reach.
+
+### The Constraint
+
+- Scaling is **quality-degrading** past the fine-tune length — e.g., Llama 3.1 is trained to 128k, so going to 256k via the same scheme produces noticeably worse outputs.
+- KV cache grows linearly with context length — a 128k context holds 16× the KV blocks of 8k, consuming the memory that would otherwise serve concurrent requests.
+- Attention compute is O(seq²) for prefill — prefill a 128k prompt and TTFT skyrockets; chunked prefill (§5) mandatory.
+- Prefix caching (§4) is even more valuable with long contexts; a cache miss on 128k tokens is catastrophic.
+- Some older attention backends don't support long context efficiently — FlashInfer / FlashAttention-3 are the good paths.
+
+### The Tradeoff
+
+- **Larger `--max-model-len`**: serve longer prompts, but KV memory explodes and concurrency drops.
+- **Smaller `--max-model-len`**: higher concurrency, better TTFT, but truncation on long prompts.
+- **FP8 KV cache (§7 + §1)**: halves KV bytes, directly doubles the context × concurrency product.
+- **Sliding-window attention** (Mistral, Gemma): bounds KV growth at some quality cost on ultra-long dependencies.
+
+### Connection to Everything Else
+
+- **KV Cache (§1) / PagedAttention (§2)**: long context is ultimately a KV-cache sizing problem.
+- **Chunked Prefill (§5)**: required to keep TTFT usable on long prompts.
+- **Prefix Caching (§4)**: essential for long-context workloads (agents, RAG, document QA).
+- **Attention Backends (§21)**: pick a backend that handles the long-context code paths well.
+- **Quantization (§7)**: FP8 KV cache is the single biggest long-context enabler on B200.
+
+**vLLM code**: `vllm/model_executor/layers/rotary_embedding/` (YaRN, linear, dynamic, Llama 3, LongRoPE, mRoPE implementations), `vllm/config/model.py` (`max_model_len`, `rope_scaling` override), `vllm/config/cache.py` (KV budget under long context).
+
+---
+
+## 33. Plugin System
+
+### The Problem
+
+vLLM's in-tree model, platform, and quant-method lists are long, but they'll never cover everything. Users want to:
+
+- Ship a proprietary model architecture without upstreaming it.
+- Add a new accelerator (a custom ASIC) without modifying `vllm/platforms/`.
+- Register a new quantization method or attention backend in their own package.
+- Override behavior for an existing model without forking vLLM.
+
+Forking vLLM for each of these is painful and diverges from upstream.
+
+### The Solution
+
+Two plugin entry-point groups exposed via Python packaging metadata:
+
+- **`vllm.platform_plugins`** — runs before any platform detection. Can install a new `Platform` subclass into `current_platform`.
+- **`vllm.general_plugins`** — runs after platform selection but before model load. Can register new model architectures, attention backends, quantization methods, tool parsers, reasoning parsers.
+
+vLLM discovers them at import time by walking `importlib.metadata.entry_points()`.
+
+### How It Works
+
+A third-party package declares:
+
+```toml
+# pyproject.toml
+[project.entry-points."vllm.general_plugins"]
+my_models = "my_pkg.vllm_hooks:register"
+```
+
+And in `my_pkg/vllm_hooks.py`:
+
+```python
+from vllm import ModelRegistry
+from my_pkg.my_llama import MyCustomLlama
+
+def register():
+    ModelRegistry.register_model(
+        "MyCustomLlamaForCausalLM",    # HF config's architectures[0]
+        MyCustomLlama,                 # vLLM-style model class
+    )
+```
+
+At `import vllm`:
+
+```
+1. vllm.plugins.load_plugins_by_group("vllm.platform_plugins")
+   └─ each plugin may call current_platform.set_implementation(...)
+2. platform auto-detect finalizes
+3. vllm.plugins.load_plugins_by_group("vllm.general_plugins")
+   └─ each plugin calls ModelRegistry.register_model / register_quant / ...
+4. user code calls LLM(model="MyCustomLlama-7B")
+   └─ Model Registry (§16) finds it via the name the plugin registered
+```
+
+Out-of-tree extension points:
+
+| Hook | Registry call |
+|---|---|
+| Model architecture | `ModelRegistry.register_model(arch_name, cls)` |
+| Platform | Provide a `Platform` subclass via `vllm.platform_plugins` |
+| Quant method | Register in `vllm/model_executor/layers/quantization/` method registry |
+| Attention backend | Subclass `AttentionBackend` and register |
+| Tool parser | Register under a name usable with `--tool-call-parser` |
+| Reasoning parser | Register under a name usable with `--reasoning-parser` |
+
+### The Constraint
+
+- Plugins load on **every** `import vllm` in every process (API server, engine core, each worker). Slow plugin imports slow startup for every rank.
+- A buggy plugin that raises at registration time takes down the whole process — vLLM catches and logs, but a silently wrong registration (e.g., overriding a built-in model) is hard to debug.
+- The plugin API is **not** versioned as strictly as `vllm`'s public Python API. Upgrading vLLM may break plugins.
+- Some registrations must happen before `EngineCore` forks workers — plugins that mutate global state after startup will be visible on rank 0 only.
+
+### The Tradeoff
+
+- **Plugin** — clean separation, stays in sync with upstream, no merge conflicts, but depends on plugin API stability.
+- **Fork** — full control, but constant rebase burden and harder to collaborate with upstream.
+
+### Connection to Everything Else
+
+- **Model Registry (§16)**: the primary target of most plugins.
+- **Platform Abstraction (§27)**: how new accelerators inject themselves.
+- **Attention Backends (§21) / Quantization (§7)**: can be extended the same way.
+- **Tool Calling (§28) / Reasoning Models (§29)**: new parsers register through the general plugin path.
+
+**vLLM code**: `vllm/plugins/__init__.py` (entry-point discovery + loading), `vllm/model_executor/models/registry.py` (`ModelRegistry.register_model`), and each extension point has its own `register_*` hook inside its subsystem.
