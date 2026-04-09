@@ -333,26 +333,6 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
                 non_spec_query_start_loc_cpu, FLA_CHUNK_SIZE
             ).to(device=gpu_device, non_blocking=True)
 
-        chunk_indices: torch.Tensor | None = None
-        chunk_offsets: torch.Tensor | None = None
-        if num_prefills > 0:
-            # Only prefill batches use FLA chunk ops.
-            # Pre-compute on CPU and async-copy to GPU to avoid
-            # GPU→CPU sync (.tolist()) in prepare_chunk_indices.
-            from vllm.model_executor.layers.fla.ops.index import (
-                prepare_chunk_indices,
-                prepare_chunk_offsets,
-            )
-            from vllm.model_executor.layers.fla.ops.utils import FLA_CHUNK_SIZE
-
-            gpu_device = query_start_loc.device
-            chunk_indices = prepare_chunk_indices(
-                non_spec_query_start_loc_cpu, FLA_CHUNK_SIZE
-            ).to(device=gpu_device, non_blocking=True)
-            chunk_offsets = prepare_chunk_offsets(
-                non_spec_query_start_loc_cpu, FLA_CHUNK_SIZE
-            ).to(device=gpu_device, non_blocking=True)
-
         if num_prefills > 0:
             has_initial_state = context_lens_tensor > 0
             if spec_sequence_masks_cpu is not None:
