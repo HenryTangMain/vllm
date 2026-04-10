@@ -2992,3 +2992,406 @@ Out-of-tree extension points:
 - **Tool Calling (§28) / Reasoning Models (§29)**: new parsers register through the general plugin path.
 
 **vLLM code**: `vllm/plugins/__init__.py` (entry-point discovery + loading), `vllm/model_executor/models/registry.py` (`ModelRegistry.register_model`), and each extension point has its own `register_*` hook inside its subsystem.
+
+---
+
+## 34. Model Runner V2
+
+> **Status**: experimental, under active development. The old `gpu_model_runner.py` is still the default — V2 is the successor path that is being built up feature-by-feature.
+
+### The Problem
+
+The original `vllm/v1/worker/gpu_model_runner.py` is a single ~3000-line file that owns: input batch construction, attention metadata, CUDA graph capture, speculative decoding, DP/CP/PP coordination, EPLB hooks, LoRA, structured output, KV connector glue, sampling, pooling, warmup, and memory profiling. Any feature touches this one file, and reasoning about interactions (e.g. "does spec decode compose with DP + chunked prefill + EPLB?") is extremely hard.
+
+### The Solution
+
+Decompose the model runner into a directory of focused modules under `vllm/v1/worker/gpu/`, with a minimal, stable `model_runner.py` at the top that just composes them. Each concern lives in its own file: attention metadata, block table, CUDA graph lifecycle, DP/CP/PP helpers, EPLB, LoRA, sampling, pooling, spec decode, structured output, warmup. The top-level file is explicitly marked "be paranoid about adding new lines" — all feature complexity must be hidden in a helper.
+
+### How It Works
+
+```
+vllm/v1/worker/gpu/
+├── model_runner.py        ← top-level orchestrator; stays minimal
+├── input_batch.py         ← request batch state + updates per step
+├── attn_utils.py          ← attention metadata build
+├── block_table.py         ← per-request KV block tables
+├── cudagraph_utils.py     ← piecewise CUDA graph capture/replay
+├── dp_utils.py            ← Data Parallel coordination hooks
+├── cp_utils.py            ← Context Parallel helpers
+├── pp_utils.py            ← Pipeline Parallel helpers
+├── eplb_utils.py          ← EPLB rebalance hook into the step loop
+├── lora_utils.py          ← LoRA adapter swap per-batch
+├── sample/                ← sampling pipeline
+├── pool/                  ← pooling / embedding / scoring path
+├── spec_decode/           ← speculative decode draft+verify
+├── structured_outputs.py  ← bitmask application
+├── warmup.py              ← startup warmup + graph capture
+├── states.py              ← per-request lifecycle states
+└── mm/                    ← multimodal batching
+```
+
+Design rules (literally in the file's docstring):
+
+> *Be paranoid about changing this file. It should remain stable. Be even more paranoid about adding new lines. It should remain minimal. Even for shared features, keep the complexity out of this path. The less common the feature, the more it should be hidden.*
+
+So the pattern for adding a feature is: put logic in a helper module, then add **one line** in `model_runner.py` that calls it.
+
+V2 ships with a **config-validation gate** (`gpu_model_runner_oracle` / PR #38758, #37307): at startup, it refuses to run configurations it doesn't yet support, so users who opt into V2 get a clean error instead of silent misbehavior.
+
+### The Constraint
+
+- **Feature coverage lags V1**. Some advanced combinations (certain spec-decode + DP + CP intersections) still only work on the old runner. The oracle actively refuses unsupported combos.
+- **Opt-in only** right now — V1 stays default until feature parity is reached.
+- Running V1 and V2 side-by-side means every feature that touches the model runner has to be added twice until V1 is retired.
+- Refactor churn — file layout can still change. External patches against V2 are at higher rebase risk than V1.
+
+### The Tradeoff
+
+| | V1 (`gpu_model_runner.py`) | V2 (`vllm/v1/worker/gpu/`) |
+|---|---|---|
+| Maturity | Battle-tested, default | Experimental |
+| Feature coverage | Everything | Growing — oracle gates the rest |
+| Readability | One giant file | Many small focused files |
+| Feature velocity | Slower (everything conflicts) | Faster (independent modules) |
+| Who should use it | Anyone serving today | Contributors, CI perf work, early adopters |
+
+### Connection to Everything Else
+
+- **Scheduler (§19)**: unchanged — V2 consumes the same `SchedulerOutput`.
+- **EngineCore (§23)**: V2 plugs into the same executor; the engine loop doesn't know which runner is below it.
+- **CUDA Graphs (§9) / torch.compile (§20)**: `cudagraph_utils.py` isolates capture logic that was previously tangled into the monolith.
+- **EPLB (§37)**, **DBO (§31)**, **Spec Decode (§6)**: each gets its own module under `gpu/`, composed into the step loop rather than inlined.
+- **LoRA (§18), Structured Output (§15), Pooling (§36)**: all moved to dedicated helpers.
+
+**vLLM code**: `vllm/v1/worker/gpu/model_runner.py` (top-level orchestrator), `vllm/v1/worker/gpu/README.md` (design notes from Woosuk), supporting modules listed above. The current default V1 path remains `vllm/v1/worker/gpu_model_runner.py`.
+
+---
+
+## 35. KV Offload & Hierarchical Memory (HMA)
+
+### The Problem
+
+GPU HBM is expensive and finite (H100 has 80 GB, B200 has 192 GB). Long-context, multi-turn workloads generate far more KV cache than fits in HBM. Once the cache fills, the scheduler has to **preempt** requests (§19), throwing away their KV and re-prefilling later — huge wasted compute. But looking at the full system, there's often **free CPU RAM** (hundreds of GB) and **idle SSD bandwidth** right next to the GPU. If we could tier the KV cache — hot blocks in HBM, warm blocks in RAM, cold blocks on SSD — preemption would rarely be necessary.
+
+### The Solution
+
+A **hierarchical KV cache** manager that treats HBM, host RAM, and (optionally) SSD / remote store as a multi-level cache. Evicted blocks flow down the hierarchy (`GPU → CPU → disk`) instead of being discarded; promotions happen lazily on access. It sits between the block allocator and the scheduler, so from the scheduler's point of view "free blocks" includes blocks that can be **demoted** cheaply, not just truly free slots.
+
+### How It Works
+
+```
+Request KV cache blocks logically live somewhere in this stack:
+
+┌────────────────────────────────────────┐
+│  GPU HBM  (hot)       — direct attn read │  ← fastest, smallest
+├────────────────────────────────────────┤
+│  CPU RAM  (warm)      — DMA in on hit    │  ← ~100s GB, PCIe bw
+├────────────────────────────────────────┤
+│  SSD / remote (cold)  — paged in on hit  │  ← ~TB, slow
+└────────────────────────────────────────┘
+
+Events:
+  miss in HBM, hit in RAM     → DMA the block back to HBM, continue decode
+  miss in both                → scheduler must preempt or wait for prefill
+  eviction under pressure     → instead of free(), demote: HBM → RAM → SSD
+```
+
+Architecture pieces under `vllm/v1/kv_offload/`:
+
+- **`spec.py`** — declares tier specs (device, medium, capacity, bandwidth).
+- **`manager.py`** — tracks which level each block currently lives at; handles promote / demote / admission.
+- **`policies/`** — eviction + promotion policies (LRU, ARC, priority-aware variants).
+- **`worker/worker.py`** — the GPU-side worker that performs the actual DMA transfers between HBM and pinned host memory, ideally overlapping with compute.
+- **`cpu/cpu_gpu.py`** — CPU↔GPU block movement primitives.
+- **Group hashing** — an extension (PR #37109) that tracks block hashes per **group** so prefix-cached blocks can be shared across requests even when they live in different tiers.
+
+HMA ("Hierarchical Memory Allocation") is the umbrella name vLLM uses for this whole machinery.
+
+### The Constraint
+
+- **Latency tax on misses**. A block that has to come back from host RAM adds PCIe transfer time to that decode step (measured in low ms). From SSD it's tens of ms — often worse than re-prefilling a short prompt.
+- **Bandwidth shared with other things**. PCIe is also used by NIXL KV transfers (§12) and multimodal uploads — concurrent offload traffic can choke out disaggregation.
+- **Not all attention backends / KV cache layouts support it yet**. The worker has to know the physical layout to copy cleanly.
+- Correctness is subtle: eviction during spec decode verify (§6) must not demote a block that's about to be read.
+
+### The Tradeoff
+
+| Setting | Wins when | Loses when |
+|---|---|---|
+| **No offload** (default) | Short contexts, HBM never fills | Long contexts, preemption storms |
+| **HBM + CPU** | Lots of host RAM, PCIe available | Very short prompts (miss latency > recompute) |
+| **HBM + CPU + SSD** | Massive contexts, batch of agents with huge KV | Interactive workloads (SSD miss is too slow) |
+
+Rule of thumb: enable KV offload if you see sustained preemptions (§19) in production and your host has idle RAM.
+
+### Connection to Everything Else
+
+- **KV Cache (§1) / PagedAttention (§2)**: offload operates at the block level — same unit as paged attention.
+- **Prefix Caching (§4)**: prefix-cached blocks are the perfect candidates to demote instead of evict — they're likely to be reused by a future request.
+- **Scheduler (§19)**: preemption pressure is the signal that triggers offload usefulness; with HMA enabled, the scheduler can treat demoted blocks as "reclaimable" rather than "free".
+- **NIXL (§12) / KV Connector (§11)**: offload is *local* tiering; NIXL is *remote* transfer. They solve different problems and can coexist.
+- **Long Context (§32)**: the single biggest reason to enable offload.
+
+**vLLM code**: `vllm/v1/kv_offload/spec.py`, `vllm/v1/kv_offload/manager.py`, `vllm/v1/kv_offload/factory.py`, `vllm/v1/kv_offload/policies/`, `vllm/v1/kv_offload/worker/worker.py`, `vllm/v1/kv_offload/cpu/cpu_gpu.py`, plus `vllm/v1/simple_kv_offload/` (a simpler reference implementation).
+
+---
+
+## 36. Pooling, Embeddings, Scoring & Reranking
+
+### The Problem
+
+Not every LLM-shaped workload is "generate tokens". A huge class of production traffic is **non-generative**: BERT-style sentence embeddings for vector DBs, cross-encoder scoring for reranking, classification heads, ColBERT-style late interaction (MaxSim), Qwen3-ForcedAligner token classification. These tasks share vLLM's scheduler, KV cache, and attention kernels, but skip sampling, skip decode, and return **vectors or scores** instead of text.
+
+Bolting them onto the generation API would be awkward — the request has no `max_tokens`, no temperature, no streaming. They deserve first-class endpoints.
+
+### The Solution
+
+A dedicated **pooling subsystem** (`vllm/entrypoints/pooling/`) that exposes OpenAI-compatible embedding, scoring, classification, and reranking endpoints, backed by a shared engine that runs a single forward pass per request and applies a **pooling head** (mean, CLS, last-token, MaxSim, classifier) instead of autoregressive decode.
+
+### How It Works
+
+```
+POST /v1/embeddings            → embedding endpoint (mean / CLS / last-token pool)
+POST /v1/score                 → cross-encoder scoring (pair → scalar)
+POST /rerank   (or /v2/rerank) → list rerank (query + docs → ranked list)
+POST /classify                 → classification head (logits per class)
+
+Each hits:
+
+┌──────────────────────────┐
+│ Pooling request handler  │  ← tokenizes, builds batch
+└──────────┬───────────────┘
+           ▼
+┌──────────────────────────┐
+│ Same EngineCore (§23)    │  ← scheduler, KV cache, attention
+│ with pooling model class │  ← forward pass only (no decode loop)
+└──────────┬───────────────┘
+           ▼
+┌──────────────────────────┐
+│ Pooling head             │  ← mean / CLS / last / MaxSim / classifier
+└──────────┬───────────────┘
+           ▼
+      Vector / score / rerank list
+```
+
+Pooling-capable models register a `pooler` alongside the LM. Examples:
+
+| Model type | Pool op | Endpoint |
+|---|---|---|
+| `bge-*`, `e5-*`, `nomic-embed-*` | mean / CLS | `/v1/embeddings` |
+| `bge-reranker-*`, `ms-marco-MiniLM` | cross-encoder score | `/v1/score`, `/rerank` |
+| ColBERT / ColModernVBERT | MaxSim late interaction (GPU) | `/v1/embeddings` + MaxSim op |
+| Classifier heads (Qwen3-ForcedAligner) | classification logits | `/classify` |
+| VLM2Vec / CLIP | multimodal embedding | `/v1/embeddings` (image+text) |
+
+Under `vllm/entrypoints/pooling/` you get `base/`, `classify/`, `embed/`, `pooling/`, `scoring/` handlers plus `io_processor_factories.py` that maps request shapes into the engine.
+
+### The Constraint
+
+- Pooling models are typically **encoder-only or encoder-decoder**, which means they run **one** forward pass per request — no continuous batching win from overlapping prefill/decode (§3). Throughput comes purely from big prefill batches.
+- KV cache is barely used (or not at all for encoder-only) — most of the KV-cache machinery is dead weight for these workloads.
+- Pooling heads are model-specific; adding a new one often requires registering a custom pooler and an I/O processor.
+- Some tasks (reranking) need to run one forward per (query, doc) pair — pair batching matters more than token batching.
+
+### The Tradeoff
+
+- **Pro**: Same engine, same ops team, same HTTP surface, same quantization / TP story — you don't need a separate embedding server.
+- **Con**: The engine's sophistication (scheduler, KV paging, chunked prefill, spec decode) is mostly wasted on encoder-only workloads. A dedicated encoder server can be leaner for that narrow case.
+
+Best fit: mixed shops that already serve LLMs on vLLM and want embeddings/rerankers from the same stack.
+
+### Connection to Everything Else
+
+- **EngineCore (§23)**: same process, same scheduler, different pool-head output.
+- **Model Registry (§16)**: pooling models register with a pooler rather than (or alongside) a sampler.
+- **Multi-Modal (§17)**: multimodal embedding models (CLIP, VLM2Vec) use the multimodal input processor for images, then pool.
+- **Quantization (§7) / TP (§8)**: apply normally to pooling models — embedding throughput benefits from both.
+- **Sampling (§14)**: completely bypassed — the pooler produces the final output.
+
+**vLLM code**: `vllm/entrypoints/pooling/` (endpoint handlers and dispatch), `vllm/entrypoints/pooling/io_processor_factories.py`, `vllm/model_executor/layers/pooler.py` (pooling heads), `vllm/v1/worker/gpu/pool/` (runner-v2 pooling path).
+
+---
+
+## 37. EPLB — Expert Parallel Load Balancing
+
+### The Problem
+
+Mixture-of-Experts models (Mixtral, DeepSeek-V2/V3, Qwen3-MoE, Llama 4 Maverick) route each token to a small subset of experts (§8). In real traffic, the **routing is not uniform** — some experts get hit far more than others. With Expert Parallelism splitting experts across GPUs, the hot experts' GPUs become bottlenecks while the cold experts' GPUs sit idle. Total throughput is dragged down to the speed of the busiest GPU.
+
+Worse, the "hot" set shifts over time as traffic changes — a static expert placement can't track it.
+
+### The Solution
+
+**EPLB (Expert Parallel Load Balancing)** periodically measures per-expert activation counts, then **rebalances expert placement** across EP ranks to equalize load — moving hot experts away from crowded GPUs and reassigning cold experts to make room. It runs as a background-ish step in the worker, hooked into the model runner.
+
+### How It Works
+
+```
+Every N steps:
+  1. Each rank reports its expert activation counts (sum over the window)
+  2. Coordinator gathers counts, runs a balancing policy
+  3. Policy decides: "move expert 17 from rank 3 → rank 6"
+  4. Broadcast the new placement
+  5. Workers swap expert weights across ranks (all-to-all copy)
+  6. Router state updated so subsequent tokens go to the new location
+```
+
+Architecture pieces under `vllm/distributed/eplb/`:
+
+- **`eplb_state.py`** — current placement, activation histograms, window config.
+- **`eplb_utils.py`** — counting, histogram aggregation.
+- **`eplb_communicator.py`** — the all-to-all weight movement primitives.
+- **`rebalance_execute.py`** — applies a new placement to live workers.
+- **`policy/`** — balancing policies (greedy, min-max, etc.).
+- **`async_worker.py`** — runs the rebalance work off the critical path where possible.
+
+Integration:
+
+- **Model Runner V2 (§34)** has an `eplb_utils.py` hook that the runner calls each step.
+- A GPU Worker V2 path (`vllm/v1/worker/gpu/eplb_utils.py`) exposes the same hook.
+- Policies can be swapped via config; the default keeps rebalance frequency low to amortize the copy cost.
+
+### The Constraint
+
+- **Rebalance is expensive** — moving an expert means copying tens to hundreds of MB across NVLink. Do it too often and the copies cost more than the imbalance.
+- **Weight copies stall the step** unless scheduled off-path; the `async_worker.py` variant tries to hide this, but not all backends support it.
+- **Policy quality matters**. A naive "move the hottest expert" policy can oscillate; production policies need hysteresis.
+- **Only helps MoE models** — dense models ignore EPLB entirely.
+- **Cooperates awkwardly with CUDA graphs** — if the model is captured and an expert moves, the captured graph still points at the old location. Graphs must be re-captured or invalidated on rebalance.
+
+### The Tradeoff
+
+- **Static placement** — zero runtime cost, can be badly imbalanced, never adapts.
+- **EPLB (periodic)** — adapts to traffic, costs weight-copy bandwidth, needs careful cadence.
+- **Per-step EPLB** — maximum responsiveness, prohibitive copy cost; rarely useful.
+
+Typical production setup: enable EPLB with a window of thousands of steps so the rebalance amortizes nicely.
+
+### Connection to Everything Else
+
+- **TP/EP/PP (§8)**: EPLB lives entirely inside the EP dimension; it reshuffles the expert-to-rank mapping that EP defined.
+- **Model Runner V2 (§34)**: EPLB has its own dedicated hook module there (`gpu/eplb_utils.py`) — one of the motivating examples for the V2 decomposition.
+- **CUDA Graphs (§9)**: rebalance forces graph re-capture / invalidation on affected ranks.
+- **Scheduler (§19)**: unaware of EPLB; load balance is a worker-layer concern.
+- **PD Disaggregation (§10)**: EPLB runs independently on each instance; decode pools in particular benefit most because decode is where MoE routing imbalance usually hurts.
+
+**vLLM code**: `vllm/distributed/eplb/eplb_state.py`, `eplb_utils.py`, `eplb_communicator.py`, `rebalance_execute.py`, `async_worker.py`, `policy/`, plus integration hooks in `vllm/v1/worker/gpu/eplb_utils.py` and the model runner.
+
+---
+
+## 38. Batch-Invariant / Deterministic Inference
+
+### The Problem
+
+Run the same prompt twice through the same model on the same GPU, and you can get **different outputs**. Not because of sampling (temperature=0, greedy), but because of **batch composition**: the same request batched with different neighbors hits different reduction orders in matmuls, different tile schedules, different attention-block boundaries — and floating-point addition is non-associative, so `(a+b)+c ≠ a+(b+c)` at the last few bits. Those last few bits change the argmax on close logits, and now token #37 is a different word.
+
+This is a nightmare for:
+- **RLHF training** — rollouts aren't reproducible, so reward-model comparisons are noisy.
+- **Evaluations** — a benchmark number depends on which other requests happened to be in the batch.
+- **Debugging** — a bug that only shows up at batch-size 13 is unreproducible at batch-size 1.
+
+### The Solution
+
+A **batch-invariant mode** that restricts every kernel in the forward pass to implementations whose output is bit-identical regardless of batch shape, padding, or neighbor composition. Enabled via an env flag / config; when on, vLLM swaps in deterministic variants of matmul, attention, norms, reductions, and sampling.
+
+### How It Works
+
+```
+VLLM_BATCH_INVARIANT=1  (opt-in)
+        │
+        ▼
+vllm/model_executor/layers/batch_invariant.py
+        │
+   registers deterministic replacements:
+        ├─ linear → fixed reduction order matmul
+        ├─ layernorm / RMSNorm → deterministic reduction
+        ├─ attention → backend that ignores batch-neighbors in per-req math
+        ├─ sampling → deterministic top-k / top-p / argmax
+        └─ rejection sampler (spec decode) → deterministic fused kernel
+```
+
+What "bit-identical across batch shapes" costs:
+
+- Linear layers give up some tile-scheduling freedom → throughput drops.
+- Attention kernels must compute each request independently of its neighbors → some vectorization wasted on padding.
+- Sampling must use a deterministic implementation instead of cheap approximate top-k.
+- Sorting ties and softmax numerics must be resolved in a fixed order.
+
+The mode is **opt-in and explicit** because of that cost. Recent PRs (#38496, #39322) added fused deterministic kernels so the tax is smaller than it used to be.
+
+### The Constraint
+
+- **Not all backends support it**. FlashAttention deterministic variants exist; some older kernels don't. If the mode is on and the backend can't honor it, vLLM errors at startup.
+- **Composition with spec decode** is subtle — the acceptance sampler has to be deterministic too (that's the point of the fused rejection-sample kernels).
+- **Throughput cost is real** — typically 5-20% depending on the model and hardware. Never enable it for pure serving; enable it only when you actually need reproducibility.
+- **Hardware-level variation** (different GPUs, different CUDA versions) can still diverge. Batch-invariance is within a given GPU+build, not across all machines.
+
+### The Tradeoff
+
+| Mode | Bit-identical? | Throughput | Use case |
+|---|---|---|---|
+| **Default** | No (across batches) | Full | Production serving |
+| **Batch-invariant** | Yes (for a fixed GPU+build) | -5 to -20% | RLHF rollouts, evals, debugging, numerical research |
+
+### Connection to Everything Else
+
+- **Sampling (§14)**: deterministic top-k / top-p / multinomial variants replace the defaults.
+- **Speculative Decoding (§6)**: the rejection sampler needs its own deterministic kernel — recent work specifically targeted this.
+- **CUDA Graphs (§9) / torch.compile (§20)**: deterministic kernels must be graph-capturable; compilation still works, just with different kernels.
+- **Quantization (§7)**: batch-invariant NVFP4 linear is now supported (PR #39322). Lower-precision paths historically had the worst batch variance.
+- **Sleep Mode (§30) / RLHF**: this is the primary consumer. Reproducible rollouts are essential for RLHF to make sense.
+
+**vLLM code**: `vllm/model_executor/layers/batch_invariant.py` (registry and kernel swaps), `vllm/model_executor/layers/linear.py` / `layernorm.py` (deterministic paths gated on the env var), `vllm/v1/worker/gpu_worker.py` (mode propagation), and the deterministic rejection sampler under `vllm/v1/sample/`.
+
+---
+
+## 39. Sliding Window, Full Attention & Hybrid KV Cache Manager
+
+### Problem
+A single uniform KV cache manager can't represent modern models. Mistral/Gemma/Phi-3 use sliding-window attention (SWA) with bounded receptive fields; Jamba/Mamba hybrids interleave attention with SSM state layers; Llama 4 mixes chunked-local with full-attention "anchor" layers. Each layer type wants a different allocation policy, and forcing them all into one full-attention pool either OOMs or wastes memory.
+
+### Solution
+Three concepts working together:
+
+1. **Full Attention** — every token attends to every previous token. KV cache grows `O(L)` per layer per request. The default; dominant cost in long-context serving.
+2. **Sliding Window Attention (SWA)** — token at position `i` only attends to `[i-W+1, i]`. KV cache bounded to `O(min(L, W))`; older blocks are *architecturally* dead and recycled mid-request.
+3. **Hybrid KV Cache Manager** — per request, vLLM tracks multiple **KV cache groups**, one per distinct layer spec, each with its own block pool and policy.
+
+### How It Works
+
+**Full attention**: stored in PagedAttention blocks (§2). One block table per request; blocks freed only on request finish or prefix-cache LRU eviction.
+
+**Sliding window**:
+- Attention kernels (FlashAttention, FlashInfer) take a `window_size` parameter and mask accordingly — no extra compute cost.
+- Once a block falls entirely outside the window, vLLM returns it to the free pool *during* the request. The block table stays small even at 1M tokens.
+- Prefix caching still works but only the in-window slice is reusable.
+
+**Hybrid manager**:
+
+| Group type     | Spec                          | Allocation               |
+|----------------|-------------------------------|--------------------------|
+| Full attention | `FullAttentionSpec`           | Grows with sequence      |
+| Sliding window | `SlidingWindowSpec(window=W)` | Bounded; rolls blocks    |
+| Mamba / SSM    | `MambaSpec`                   | Fixed-size state per req |
+| Chunked-local  | `ChunkedLocalAttentionSpec`   | Bounded per chunk        |
+
+1. At init, vLLM walks the model and builds a `KVCacheConfig` listing each layer's spec.
+2. Layers with identical specs are coalesced into one group sharing a block pool (e.g. all 30 SWA layers in Gemma share one allocator).
+3. Scheduler admission: "can I fit `n` new tokens for request R?" must satisfy *every* group simultaneously. The tightest group bottlenecks admission.
+4. Prefix caching is per-group: hashes computed independently, request hits cache only when *all* groups hit.
+5. Eviction is per-group LRU.
+
+### Constraint
+Hybrid scheduling is more expensive: every admission check queries N group allocators instead of one. Prefix-cache hit rates can drop because hybrid hits require all-group agreement.
+
+### Tradeoff
+More bookkeeping for dramatically lower memory on hybrid models. Gemma-3 27B at 128k context fits where a uniform full-attention manager would OOM. SWA trades unbounded long-range attention for bounded memory — a model architecture choice, not a vLLM choice.
+
+### Connection
+- **§2 PagedAttention**: block storage substrate both managers sit on top of.
+- **§4 Prefix Caching**: hybrid manager hashes per group; SWA blocks beyond the window aren't kept.
+- **§19 Scheduler**: admission check queries every group.
+- **§21 Attention Backends**: backend kernels implement the actual `window_size` masking.
+- **§35 KV Offload / HMA**: orthogonal — HMA tiers storage across GPU/CPU; hybrid manager partitions by layer type.
+
+**vLLM code**: `vllm/v1/core/kv_cache_manager.py`, `vllm/v1/core/single_type_kv_cache_manager.py`, `vllm/v1/core/kv_cache_coordinator.py` (hybrid coordination), specs in `vllm/v1/kv_cache_interface.py` (`FullAttentionSpec`, `SlidingWindowSpec`, `MambaSpec`, `ChunkedLocalAttentionSpec`).
