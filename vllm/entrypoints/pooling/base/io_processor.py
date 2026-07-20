@@ -2,9 +2,12 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 from collections.abc import Sequence
-from typing import Any, Final
+from typing import Any, Final, cast
 
-from vllm import PoolingParams, PoolingRequestOutput, PromptType
+from vllm import (
+    PoolingParams,
+    PoolingRequestOutput,
+)
 from vllm.config import VllmConfig
 from vllm.entrypoints.chat_utils import (
     ChatCompletionMessageParam,
@@ -12,23 +15,37 @@ from vllm.entrypoints.chat_utils import (
     ChatTemplateContentFormatOption,
     ConversationMessage,
 )
-from vllm.entrypoints.openai.engine.serving import RendererChatRequest, RendererRequest
-from vllm.entrypoints.pooling.scoring.typing import ScoringData
-from vllm.entrypoints.pooling.typing import (
-    OfflineInputsContext,
-    OfflineOutputsContext,
-    PoolingChatLikeRequest,
-    PoolingCompletionLikeRequest,
-    PoolingServeContext,
-)
+from vllm.entrypoints.serve.engine.typing import RendererChatRequest, RendererRequest
 from vllm.inputs import EngineInput, SingletonPrompt
-from vllm.renderers import BaseRenderer, TokenizeParams, merge_kwargs
+from vllm.lora.request import LoRARequest
+from vllm.renderers import BaseRenderer, merge_kwargs
 from vllm.renderers.inputs.preprocess import parse_model_prompt, prompt_to_seq
 from vllm.tool_parsers import ToolParser
 from vllm.utils.mistral import is_mistral_tokenizer
 
+from ..typing import (
+    ALLOfflineInputsContext,
+    EncodeChatRenderParams,
+    EncodeCMPLRenderParams,
+    OfflineEncodeInputsContext,
+    OfflineOutputsContext,
+    PoolingChatLikeRequest,
+    PoolingCompletionLikeRequest,
+    PoolingEngineInput,
+    PoolingServeContext,
+    RequestFactory,
+    RequestGenerator,
+    ScoringRenderParams,
+)
+
 
 class PoolingIOProcessor:
+    """Processor for handling preprocessing & postprocessing ops for pooling requests.
+
+    This class manages both online (serving) and offline (batch) processing of pooling
+    requests, handling chat and completion formats.
+    """
+
     name: str
 
     def __init__(
@@ -58,7 +75,7 @@ class PoolingIOProcessor:
     def pre_process_online(self, ctx: PoolingServeContext):
         request = ctx.request
 
-        if isinstance(ctx.request, PoolingChatLikeRequest):
+        if isinstance(request, PoolingChatLikeRequest):
             self._validate_chat_template(
                 request_chat_template=request.chat_template,
                 chat_template_kwargs=request.chat_template_kwargs,
@@ -72,7 +89,7 @@ class PoolingIOProcessor:
                 default_template_kwargs=None,
             )
         elif isinstance(request, PoolingCompletionLikeRequest):
-            engine_inputs = self._preprocess_completion_online(
+            engine_inputs = self._preprocess_cmpl_online(
                 request,
                 prompt_input=request.input,
                 prompt_embeds=None,
@@ -82,39 +99,71 @@ class PoolingIOProcessor:
 
         ctx.engine_inputs = engine_inputs
 
-    async def pre_process_online_async(self, ctx: PoolingServeContext):
-        self.pre_process_online(ctx)
-
     def post_process_online(
         self,
         ctx: PoolingServeContext,
     ):
         pass
 
-    async def post_process_online_async(
-        self,
-        ctx: PoolingServeContext,
-    ):
-        self.post_process_online(ctx)
-
     #######################################
     # offline APIs
 
-    def pre_process_offline(self, ctx: OfflineInputsContext) -> Sequence[EngineInput]:
-        assert not isinstance(ctx.prompts, ScoringData) and not (
-            isinstance(ctx.prompts, dict) and "data" in ctx.prompts
-        )
+    def get_request_factory_offline(
+        self, ctx: ALLOfflineInputsContext
+    ) -> tuple[RequestFactory, int]:
+        assert isinstance(ctx, OfflineEncodeInputsContext)
 
         prompts_seq = prompt_to_seq(ctx.prompts)
+        num_requests = len(prompts_seq)
+        pooling_task = ctx.pooling_task
+
+        parsed_prompts = [
+            (
+                prompt
+                if isinstance(prompt, bytes)
+                else parse_model_prompt(self.model_config, prompt)
+            )
+            for prompt in prompts_seq
+        ]
         tok_params = self.renderer.default_cmpl_tok_params.with_kwargs(
             **(ctx.tokenization_kwargs or {})
         )
-        return self._preprocess_completion_offline(
-            prompts=prompts_seq, tok_params=tok_params
-        )
 
-    async def pre_process_offline_async(self, ctx: OfflineInputsContext):
-        return self.pre_process_offline(ctx)
+        pooling_params: PoolingParams | Sequence[PoolingParams]
+        if ctx.pooling_params is None:
+            pooling_params = PoolingParams()
+        else:
+            pooling_params = ctx.pooling_params
+
+        params_seq = self._params_to_seq(pooling_params, num_requests)
+
+        for param in params_seq:
+            if param.task is None:
+                param.task = pooling_task
+            elif pooling_task == "plugin":
+                # `plugin` task uses io_processor.parse_request to verify inputs.
+                # We actually allow plugin to overwrite pooling_task.
+                pass
+            elif param.task != pooling_task:
+                msg = f"You cannot overwrite {param.task=!r} with {pooling_task=!r}!"
+                raise ValueError(msg)
+
+        seq_lora_requests = self._lora_request_to_seq(ctx.lora_request, num_requests)
+        seq_priority = self._priority_to_seq(ctx.priorities, num_requests)
+
+        def request_factory() -> RequestGenerator:
+            for i in range(num_requests):
+                yield EncodeCMPLRenderParams(
+                    prompts=parsed_prompts[i],
+                    tok_params=tok_params,
+                    prompt_extras=None,
+                    skip_mm_cache=False,
+                    params=params_seq[i],
+                    lora_requests=seq_lora_requests[i],
+                    priorities=seq_priority[i],
+                )
+
+        return request_factory, num_requests
 
     def post_process_offline(
         self,
@@ -122,16 +171,45 @@ class PoolingIOProcessor:
     ) -> list[PoolingRequestOutput]:
         return ctx.outputs
 
-    async def post_process_offline_async(
-        self,
-        ctx: OfflineOutputsContext,
-    ) -> list[PoolingRequestOutput]:
-        return self.post_process_offline(ctx)
-
     #######################################
     # helpers
 
-    def _preprocess_completion_online(
+    def render(
+        self,
+        render_params: EncodeCMPLRenderParams
+        | EncodeChatRenderParams
+        | ScoringRenderParams,
+    ) -> PoolingEngineInput:
+        if "conversations" in render_params:
+            render_params = cast(EncodeChatRenderParams, render_params)
+            (_,), engine_input = self.renderer.render_chat(
+                conversations=[render_params["conversations"]],
+                chat_params=render_params["chat_params"],
+                tok_params=render_params["tok_params"],
+                prompt_extras=render_params["prompt_extras"],
+                skip_mm_cache=render_params["skip_mm_cache"],
+            )
+        elif "prompts" in render_params:
+            render_params = cast(EncodeCMPLRenderParams, render_params)
+            engine_input = self.renderer.render_cmpl(
+                prompts=[render_params["prompts"]],
+                tok_params=render_params["tok_params"],
+                prompt_extras=render_params["prompt_extras"],
+                skip_mm_cache=render_params["skip_mm_cache"],
+            )
+        else:
+            raise ValueError(
+                f"Unsupported render_params type {render_params.__class__.__name__}"
+            )
+
+        return PoolingEngineInput(
+            prompts=engine_input[0],
+            params=render_params["params"],
+            lora_requests=render_params["lora_requests"],
+            priorities=render_params["priorities"],
+        )
+
+    def _preprocess_cmpl_online(
         self,
         request: RendererRequest,
         prompt_input: str | list[str] | list[int] | list[list[int]] | None,
@@ -209,26 +287,6 @@ class PoolingIOProcessor:
 
         return conversation, [engine_input]
 
-    def _preprocess_completion_offline(
-        self,
-        prompts: PromptType | Sequence[PromptType],
-        tok_params: TokenizeParams,
-        prompt_extras: dict[str, Any] | None = None,
-    ) -> Sequence[EngineInput]:
-        prompts = prompt_to_seq(prompts)
-        parsed_prompts = [
-            (
-                prompt
-                if isinstance(prompt, bytes)
-                else parse_model_prompt(self.model_config, prompt)
-            )
-            for prompt in prompts
-        ]
-
-        return self.renderer.render_cmpl(
-            parsed_prompts, tok_params, prompt_extras=prompt_extras
-        )
-
     def _validate_chat_template(
         self,
         request_chat_template: str | None,
@@ -264,3 +322,35 @@ class PoolingIOProcessor:
             return params
 
         return [params] * num_requests
+
+    def _lora_request_to_seq(
+        self,
+        lora_request: LoRARequest | None | Sequence[LoRARequest | None],
+        num_requests: int,
+    ) -> Sequence[LoRARequest | None]:
+        if isinstance(lora_request, Sequence):
+            if len(lora_request) != num_requests:
+                raise ValueError(
+                    f"The lengths of prompts ({num_requests}) "
+                    f"and lora_request ({len(lora_request)}) must be the same."
+                )
+
+            return lora_request
+
+        return [lora_request] * num_requests
+
+    def _priority_to_seq(
+        self,
+        priority: Sequence[int] | None,
+        num_requests: int,
+    ) -> Sequence[int]:
+        if priority is not None:
+            if len(priority) != num_requests:
+                raise ValueError(
+                    f"The lengths of prompts ({num_requests}) "
+                    f"and priority ({len(priority)}) must be the same."
+                )
+
+            return priority
+
+        return [0] * num_requests
